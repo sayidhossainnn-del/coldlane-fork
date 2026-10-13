@@ -683,9 +683,9 @@ export interface MailboxInput {
   imap_host: string;
   imap_port: number;
   imap_user: string;
-  imap_ssl: boolean;
+  imap_ssl?: boolean;
   daily_cap: number;
-  ramp_enabled: boolean;
+  ramp_enabled?: boolean;
   sender_address: string;
   signature: string;
   active: boolean;
