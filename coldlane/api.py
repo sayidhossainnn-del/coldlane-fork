@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo
 
 from flask import Blueprint, g, jsonify, make_response, request
 
-from . import config, core, crypto, db, engine, mailer
+from . import ai, config, core, crypto, db, engine, mailer
 
 bp = Blueprint("api", __name__, url_prefix="/api")
 
@@ -123,13 +123,61 @@ def _mailbox_public(conn, row):
     return data
 
 
+# Every lead payload is built from this join so the optional AI labels and the manual
+# meeting flag travel with the lead (both are NULL/false until they are set).
+LEAD_SELECT = (
+    "SELECT l.*, c.name AS campaign_name, m.label AS mailbox_label, m.from_email AS mailbox_email, "
+    "ta.sentiment AS ai_sentiment, ta.intent AS ai_intent, ta.meeting_intent AS ai_meeting_intent, "
+    "ta.summary AS ai_summary, lm.booked_at AS meeting_booked_at, lm.note AS meeting_note "
+    "FROM leads l LEFT JOIN campaigns c ON c.id=l.campaign_id "
+    "LEFT JOIN mailboxes m ON m.id=l.mailbox_id "
+    "LEFT JOIN thread_ai ta ON ta.lead_id=l.id "
+    "LEFT JOIN lead_meetings lm ON lm.lead_id=l.id "
+)
+
+
+def _ai_fields(row, status):
+    """Optional AI labels + meeting flag of a row, plus the rule-based score."""
+    names = row.keys()
+    sentiment = row["ai_sentiment"] if "ai_sentiment" in names else None
+    intent = row["ai_intent"] if "ai_intent" in names else None
+    meeting_intent = bool(row["ai_meeting_intent"]) if "ai_meeting_intent" in names else False
+    meeting_booked = bool(row["meeting_booked_at"]) if "meeting_booked_at" in names else False
+    return {
+        "sentiment": sentiment,
+        "intent": intent,
+        "meeting_intent": meeting_intent,
+        "summary": row["ai_summary"] if "ai_summary" in names else None,
+        "meeting_booked": meeting_booked,
+        "meeting_note": row["meeting_note"] if "meeting_note" in names else None,
+        "score": core.score_lead(status=status, sentiment=sentiment,
+                                 meeting_intent=meeting_intent, meeting_booked=meeting_booked),
+    }
+
+
 def _lead_public(row):
     data = _row_data(row, LEAD_PUBLIC_FIELDS)
     try:
         data["fields"] = json.loads(row["fields_json"] or "{}")
     except (ValueError, TypeError):
         data["fields"] = {}
+    data.update(_ai_fields(row, row["status"]))
     return data
+
+
+def _thread_public(row):
+    """A threads-list row: raw ai_*/meeting_* columns become the public field names."""
+    names = row.keys()
+    data = dict(row)
+    for key in ("ai_sentiment", "ai_intent", "ai_meeting_intent", "ai_summary",
+                "meeting_booked_at", "meeting_note"):
+        data.pop(key, None)
+    data.update(_ai_fields(row, row["lead_status"]))
+    return data
+
+
+def _lead_row(conn, lead_id):
+    return conn.execute(f"{LEAD_SELECT}WHERE l.id=?", (lead_id,)).fetchone()
 
 
 def _mailbox_fields(data, existing):
@@ -241,16 +289,13 @@ def threads_list():
     limit, offset = _paging()
     rows = core.list_threads(_conn(), limit=limit, offset=offset, filter=wanted)
     return jsonify({"filter": wanted, "limit": limit, "offset": offset,
-                    "threads": [dict(row) for row in rows]})
+                    "threads": [_thread_public(row) for row in rows]})
 
 
 @bp.get("/threads/<int:lead_id>")
 def thread_detail(lead_id):
     conn = _conn()
-    lead = conn.execute(
-        "SELECT l.*, c.name AS campaign_name, m.label AS mailbox_label, m.from_email AS mailbox_email "
-        "FROM leads l LEFT JOIN campaigns c ON c.id=l.campaign_id "
-        "LEFT JOIN mailboxes m ON m.id=l.mailbox_id WHERE l.id=?", (lead_id,)).fetchone()
+    lead = _lead_row(conn, lead_id)
     if lead is None:
         return _error("Lead not found.", 404)
     messages = [_row_data(row, MESSAGE_PUBLIC_FIELDS) for row in core.get_thread(conn, lead_id)]
@@ -376,6 +421,163 @@ def thread_reply(lead_id):
         "remaining_capacity": core.remaining_capacity(conn, mb),
         "message": _row_data(saved, MESSAGE_PUBLIC_FIELDS) if saved is not None else None,
     }), 201
+
+
+# ------------------------------------------------------------- optional AI layer
+# AI is optional. While no provider is enabled (no row, enabled=0, no base_url or no
+# model) every AI endpoint answers exactly 409 {"error":"llm_not_configured"} and every
+# other endpoint behaves as before. AI never sends: it stores labels and hands back draft
+# text that a human still has to send through POST /threads/<id>/reply. The stored API
+# key is write-only -- it is never serialized, not even as a hint.
+LLM_NOT_CONFIGURED = "llm_not_configured"
+LLM_SETTINGS_PUBLIC_FIELDS = ("base_url", "model", "enabled", "draft_system_prompt", "updated_at")
+
+
+def _not_configured():
+    return _error(LLM_NOT_CONFIGURED, 409)
+
+
+def _llm_settings_public(conn):
+    settings = core.llm_settings(conn)
+    data = {key: settings[key] for key in LLM_SETTINGS_PUBLIC_FIELDS}
+    data["enabled"] = bool(settings["enabled"])
+    data["has_key"] = bool(settings["api_key_enc"])
+    data["configured"] = core.llm_configured(conn)
+    data["default_draft_system_prompt"] = ai.DEFAULT_DRAFT_SYSTEM_PROMPT
+    return data
+
+
+@bp.get("/llm-settings")
+def llm_settings_get():
+    return jsonify({"settings": _llm_settings_public(_conn())})
+
+
+@bp.put("/llm-settings")
+def llm_settings_put():
+    """Save provider settings. `api_key` is write-only (blank keeps the stored key,
+    `clear_api_key: true` removes it) and the key itself is never returned."""
+    conn = _conn()
+    data = _payload()
+    if data is None:
+        return _error("Request body must be a JSON object.", 400)
+    current = core.llm_settings(conn)
+    errors = []
+
+    def text(key, fallback):
+        if key not in data or data[key] is None:
+            return fallback
+        return str(data[key]).strip()
+
+    base_url = text("base_url", current["base_url"] or "").rstrip("/")
+    model = text("model", current["model"] or "")
+    draft_prompt = text("draft_system_prompt", current["draft_system_prompt"] or "")
+    enabled = _as_bool(data.get("enabled"), current["enabled"])
+    if base_url and not base_url.startswith(("http://", "https://")):
+        errors.append("base_url must start with http:// or https://.")
+    if enabled and not base_url:
+        errors.append("base_url is required before the LLM can be enabled.")
+    if enabled and not model:
+        errors.append("model is required before the LLM can be enabled.")
+    key_enc = current["api_key_enc"]
+    if data.get("clear_api_key"):
+        key_enc = None
+    elif str(data.get("api_key") or "").strip():
+        key_enc = crypto.encrypt(str(data["api_key"]).strip())
+    if errors:
+        return _error("Invalid LLM settings.", 400, details=errors)
+    conn.execute(
+        "INSERT INTO llm_settings(id, base_url, api_key_enc, model, draft_system_prompt, "
+        "enabled, updated_at) VALUES(1,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+        "base_url=excluded.base_url, api_key_enc=excluded.api_key_enc, model=excluded.model, "
+        "draft_system_prompt=excluded.draft_system_prompt, enabled=excluded.enabled, "
+        "updated_at=excluded.updated_at",
+        (base_url, key_enc, model, draft_prompt, enabled, core.ts(core.utcnow())),
+    )
+    return jsonify({"settings": _llm_settings_public(conn)})
+
+
+@bp.post("/llm-settings/test")
+def llm_settings_test():
+    """Tiny live request so a bad base URL/model/key is reported instead of guessed at."""
+    conn = _conn()
+    if not core.llm_configured(conn):
+        return _not_configured()
+    ok, detail = ai.test_provider(conn)
+    return jsonify({"ok": ok, "detail": detail})
+
+
+@bp.post("/threads/<int:lead_id>/classify")
+def thread_classify(lead_id):
+    """Classify the latest inbound reply of one thread. Stores labels only."""
+    conn = _conn()
+    if not core.llm_configured(conn):
+        return _not_configured()
+    if conn.execute("SELECT 1 FROM leads WHERE id=?", (lead_id,)).fetchone() is None:
+        return _error("Lead not found.", 404)
+    try:
+        classification = ai.classify(conn, lead_id)
+    except ai.LlmNotConfigured:
+        return _not_configured()
+    except ai.NoInboundMessage:
+        return _error("No inbound reply to classify yet.", 400)
+    except ai.LlmFormatError as exc:
+        return _error("rejected_model_output", 422, detail=str(exc))
+    except ai.LlmError as exc:
+        return _error("provider_error", 502, detail=str(exc))
+    return jsonify({"lead_id": lead_id, "classification": classification})
+
+
+@bp.post("/threads/<int:lead_id>/draft-reply")
+def thread_draft_reply(lead_id):
+    """Draft a reply body. Saved nowhere and sent nowhere: a human sends it."""
+    conn = _conn()
+    if not core.llm_configured(conn):
+        return _not_configured()
+    if conn.execute("SELECT 1 FROM leads WHERE id=?", (lead_id,)).fetchone() is None:
+        return _error("Lead not found.", 404)
+    data = _payload()
+    if data is None:
+        return _error("Request body must be a JSON object.", 400)
+    instructions = data.get("instructions")
+    if instructions is not None and not isinstance(instructions, str):
+        return _error("instructions must be a string.", 400)
+    try:
+        draft = ai.draft_reply(conn, lead_id, instructions)
+    except ai.LlmNotConfigured:
+        return _not_configured()
+    except ai.LlmError as exc:
+        return _error("provider_error", 502, detail=str(exc))
+    return jsonify({"lead_id": lead_id, "draft": draft})
+
+
+# ---------------------------------------------------------------- leads: meetings
+# A meeting is a manual flag only. Nothing in ColdLane books, invites or sends anything;
+# the flag feeds the lead score (+20) and the `meetings` count in the stats endpoints.
+@bp.post("/leads/<int:lead_id>/meeting")
+def lead_meeting_create(lead_id):
+    conn = _conn()
+    if conn.execute("SELECT 1 FROM leads WHERE id=?", (lead_id,)).fetchone() is None:
+        return _error("Lead not found.", 404)
+    data = _payload()
+    if data is None:
+        return _error("Request body must be a JSON object.", 400)
+    note = data.get("note")
+    if note is not None and not isinstance(note, str):
+        return _error("note must be a string.", 400)
+    core.set_meeting(conn, lead_id, note or "")
+    resp = jsonify({"lead": _lead_public(_lead_row(conn, lead_id))})
+    resp.status_code = 201
+    return resp
+
+
+@bp.delete("/leads/<int:lead_id>/meeting")
+def lead_meeting_delete(lead_id):
+    conn = _conn()
+    if conn.execute("SELECT 1 FROM leads WHERE id=?", (lead_id,)).fetchone() is None:
+        return _error("Lead not found.", 404)
+    if not core.clear_meeting(conn, lead_id):
+        return _error("No meeting is booked for this lead.", 404)
+    return jsonify({"lead": _lead_public(_lead_row(conn, lead_id))})
 
 
 # ---------------------------------------------------------------- templates
@@ -1237,10 +1439,8 @@ def leads_list():
     conn = _conn()
     total = conn.execute(f"SELECT COUNT(*) FROM leads l{where}", args).fetchone()[0]
     rows = conn.execute(
-        "SELECT l.*, c.name AS campaign_name, m.label AS mailbox_label, m.from_email AS mailbox_email "
-        f"FROM leads l LEFT JOIN campaigns c ON c.id=l.campaign_id "
-        f"LEFT JOIN mailboxes m ON m.id=l.mailbox_id{where} ORDER BY l.id LIMIT ? OFFSET ?",
-        (*args, limit, offset)).fetchall()
+        f"{LEAD_SELECT}{where} ORDER BY l.id LIMIT ? OFFSET ?", (*args, limit, offset)
+    ).fetchall()
     return jsonify({"total": total, "limit": limit, "offset": offset,
                     "leads": [_lead_public(row) for row in rows]})
 
@@ -1248,7 +1448,7 @@ def leads_list():
 @bp.get("/stats")
 def stats():
     conn = _conn()
-    keys = ("sent", "replied", "bounced", "unsubscribed")
+    keys = ("sent", "replied", "bounced", "unsubscribed", "meetings")
     total = {key: 0 for key in keys}
     per_campaign = []
     for campaign in conn.execute("SELECT * FROM campaigns ORDER BY id").fetchall():

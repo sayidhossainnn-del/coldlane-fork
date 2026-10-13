@@ -18,6 +18,7 @@ No signup. No per-seat or per-mailbox fees. Docker Compose and a SQLite file. Ab
 - [Try it offline first (test profile + GreenMail)](#try-it-offline-first-test-profile--greenmail)
 - [Production mailboxes](#production-mailboxes)
 - [How sending works](#how-sending-works)
+- [Optional AI layer](#optional-ai-layer)
 - [JSON API](#json-api)
 - [Environment variables](#environment-variables)
 - [Compliance](#compliance)
@@ -182,9 +183,33 @@ Passwords are encrypted at rest with Fernet (`ENCRYPTION_KEY`) and never shown a
   - **Auto-reply:** `Auto-Submitted`, `X-Autoreply`, `X-Autorespond` or `Precedence: auto_reply`. Logged as `auto_reply`; the sequence continues.
   - **Bounce:** a DSN (`multipart/report; report-type=delivery-status`) or a message from MAILER-DAEMON/postmaster. `5.x.x` sets `bounced` and suppresses the address; `4.x.x` is only logged.
   - **Opt-out reply:** a reply that just says "unsubscribe" / "remove me" means `unsubscribed` + suppression.
+- **Optional AI:** right after each poll the worker may classify up to 5 unclassified replies per tick — only while a provider is configured, best effort, and never touching the send loop (see [Optional AI layer](#optional-ai-layer)).
 - **Start is blocked** unless the campaign has ≥1 active mailbox, ≥1 step, ≥1 queued lead, a sender postal address for every assigned mailbox, and `PUBLIC_BASE_URL` set.
 - **Settings vs .env:** a business name or address saved in Settings overrides `.env`. A field saved **blank** in Settings counts as empty (it does not fall back to `.env`), so campaigns can't start. **Use .env values** removes the overrides. A per-mailbox address override beats both.
 - **Rates on the dashboard:** reply rate = replied ÷ leads contacted; bounce rate = bounced ÷ emails that went out.
+
+## Optional AI layer
+
+ColdLane can label replies and draft answers with any **OpenAI-compatible** chat-completions provider — OpenAI, Gemini, OpenRouter, Groq, or a local Ollama/LM Studio server — by changing only the base URL. The layer sits entirely on top of the sending machinery: it has no access to sending, caps, rotation, suppression, the footer or threading, and `web.py`/the web UI are untouched.
+
+- **Optional by design.** Settings live in `GET|PUT /api/llm-settings` (single row, `base_url`, `model`, `draft_system_prompt`, `enabled`). The API key is write-only — sent as `api_key`, cleared with `clear_api_key: true`, returned only as `has_key: true|false`, stored encrypted with the same Fernet crypto as mailbox passwords. While nothing is enabled (or `base_url`/`model` is missing) every AI endpoint answers **409 `{"error":"llm_not_configured"}`** and everything else behaves exactly as before. Calls use `{base_url}/chat/completions` with a `Bearer` key, a **30-second timeout**, and one retry on network errors; provider errors are reported (`502 provider_error` with the provider's message, or `ok:false` from the test endpoint) and never crash the worker or an API request.
+- **AI never sends.** It produces labels and draft text only. A human sends the draft through the existing `POST /api/threads/{id}/reply`.
+- **Inbound replies are untrusted.** The thread is put in the prompt as data between `<<<UNTRUSTED_EMAIL>>>` markers (marker sequences inside the message body are defused first) with instructions to ignore any instructions found inside it, and only the fixed JSON schema is accepted: `{"sentiment", "intent", "meeting_intent", "summary"}`. Anything else — prose, code fences, extra or missing keys, unknown labels, a non-boolean `meeting_intent` — is rejected with **422 `rejected_model_output`**, logged as an `ai_classify_error` event, and never stored. Model output is never executed or followed.
+- **Only this thread's own messages** are sent to the provider, truncated to **6000 characters** total (oldest context is dropped first, the newest reply is always kept). Mailbox credentials, the API key and other leads' data are never part of the prompt.
+- **Classification** (`POST /api/threads/{id}/classify`) stores `sentiment` (positive/neutral/negative), `intent` (interested/not_interested/question/out_of_office/referral/unsubscribe/other), `meeting_intent` and a summary capped at 200 characters in `thread_ai`, together with the message id and model that produced it. After each IMAP poll the worker auto-classifies up to **5** unclassified replies per tick (the newest reply per thread, only while the LLM is enabled); failures are logged and retried at most **3** times per message, then that message is skipped — none of this can block polling or sending. The labels and summary are exposed on `GET /api/threads` and `GET /api/threads/{id}`.
+- **Draft reply** (`POST /api/threads/{id}/draft-reply`, optional `instructions`) returns `{"draft": "text"}`. The draft is **not stored as a message and nothing is sent**. The system prompt is editable in settings; the default asks for a short plain-text body in a human tone, no links, no promises beyond the thread, signed off with the sender's business name.
+- **Meetings are a manual flag only:** `POST /api/leads/{id}/meeting` (optional `note`) and `DELETE /api/leads/{id}/meeting` write `lead_meetings`. Nothing is scheduled, invited or sent; the flag feeds the score and the `meetings` count in `GET /api/stats` and `GET /api/campaigns/{id}` stats.
+- **Lead score (0–100, plain rules in `core.score_lead`, no LLM).** Exposed as `score` on `GET /api/leads` and `GET /api/threads`, recomputed on the fly:
+
+  | Rule | Points |
+  | --- | --- |
+  | Lead status is `replied` | +40 |
+  | Sentiment `positive` / `neutral` / `negative` | +25 / +5 / −30 |
+  | `meeting_intent` from the classification | +15 |
+  | Meeting booked (the manual flag) | +20 |
+  | `bounced` or `unsubscribed` | **forced to 0** |
+
+  The total is clamped to 0–100 (e.g. a negative sentiment can never make it negative).
 
 ## JSON API
 
@@ -272,8 +297,23 @@ curl -X POST -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/campaigns/1/paus
 
 # Leads (campaign_id, status, limit, offset)
 curl -H "X-API-Key: $API_KEY" 'http://127.0.0.1:8080/api/leads?campaign_id=1&status=replied'
-# Stats (sent/replied/bounced/unsubscribed per campaign and total)
+# Stats (sent/replied/bounced/unsubscribed/meetings per campaign and total)
 curl -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/stats
+
+# Optional AI layer (409 {"error":"llm_not_configured"} until it is configured)
+curl -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/llm-settings
+curl -X PUT -H "Content-Type: application/json" -H "X-API-Key: $API_KEY" \
+  -d '{"base_url":"https://openrouter.ai/api/v1","model":"openai/gpt-4o-mini","api_key":"sk-...","enabled":true}' \
+  http://127.0.0.1:8080/api/llm-settings
+curl -X POST -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/llm-settings/test
+curl -X POST -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/threads/7/classify
+curl -X POST -H "Content-Type: application/json" -H "X-API-Key: $API_KEY" \
+  -d '{"instructions":"keep it to two sentences"}' http://127.0.0.1:8080/api/threads/7/draft-reply
+
+# Manual meeting flag (manual only: +20 on the lead score, counted in /api/stats)
+curl -X POST -H "Content-Type: application/json" -H "X-API-Key: $API_KEY" \
+  -d '{"note":"Tuesday 10:00"}' http://127.0.0.1:8080/api/leads/7/meeting
+curl -X DELETE -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/leads/7/meeting
 ```
 
 `GET /api/campaigns/{id}/steps` now lists each step's arms (`variants`, base `A` first with a `locked` flag) and `GET /api/campaigns/{id}/variants` reports sent/replied/bounced/unsubscribed/reply rate per step and arm, crediting a reply to the arm of the last send that reached that lead before the reply. `POST .../steps/{position}/variants`, `PUT|DELETE /api/variants/{id}` and `PUT .../steps/{position}/weights` only work while the campaign is a draft or paused; a variant's subject/body lock as soon as it has sends (**409**, create a new variant instead) while its weight and `enabled` stay editable, and `DELETE` disables a variant that has already sent so its results stay reportable. `POST /api/campaigns/{id}/preview` takes an optional `variant` label and otherwise previews the arm that lead is assigned to.
@@ -281,6 +321,8 @@ curl -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/stats
 Campaign authoring reuses the web UI's validation: mailboxes must exist, the send window must be valid, step 1 needs a subject and body, merge braces must balance, at most 5 steps, and the timezone must be a real IANA name. Import requires `lawful_basis_confirmed: true` (or the multipart field), checked **before** anything is stored, and the acknowledgement is written to the `imports` table exactly as the UI writes it (who, when, filename). Every CSV column other than `email` is kept as a merge field, emails are normalized and deduped, invalid addresses are skipped, suppressed addresses and whole suppressed domains are imported as `suppressed` (never queued), and the response reports `imported`, `duplicates`, `invalid`, `suppressed` plus the first 20 rejected rows with reasons. `PUT /api/campaigns/{id}` works only for drafts and paused campaigns and never rewrites a step that has already been sent (its position comes back in `locked_steps`); `DELETE` works only for drafts and removes that campaign's steps, mailbox links, imports and leads. `POST /api/campaigns/{id}/preview` renders one lead's next step (or an explicit `step`) with the same renderer the worker uses, reporting `merge_error` instead of raising. None of these endpoints send email — starting stays on the existing start endpoint.
 
 `POST /api/threads/{lead_id}/reply` sends a manual reply from the mailbox that emailed the lead (or an explicit `mailbox_id`), plain text with `Re: <subject>`, `In-Reply-To`/`References` set to the newest message in the thread, and the same mandatory footer, `List-Unsubscribe` headers and unsubscribe link as campaign emails. It is **not a campaign step**: the lead's `current_step` and `status` are not touched and the sequence is never restarted. It is logged in `sends.csv` with `step_pos = 0`, so it counts against the mailbox's daily cap (over the cap → **429**). A suppressed, unsubscribed or bounced lead is refused with **409**; a paused/inactive mailbox with **400**; an SMTP failure with **502** (a hard bounce suppresses the address, like the worker does).
+
+The AI endpoints (`GET|PUT /api/llm-settings`, `POST /api/llm-settings/test`, `POST /api/threads/{id}/classify`, `POST /api/threads/{id}/draft-reply`) and the meeting flags (`POST|DELETE /api/leads/{id}/meeting`) live in the same blueprint behind the same `X-API-Key` gate. `GET /api/leads` and `GET /api/threads` carry `score`, `sentiment`, `intent`, `meeting_intent`, `summary`, `meeting_booked` and `meeting_note`; `meetings` was added to the `sent/replied/bounced/unsubscribed` totals in `GET /api/stats` and to the stats object of `GET /api/campaigns/{id}`. Disabling the LLM (or never configuring one) returns those endpoints to 409 and changes nothing else.
 
 The web UI keeps working exactly as before; `/api/*` only skips the session login because it authenticates with the API key instead.
 
@@ -324,5 +366,5 @@ How that maps to the rules:
 - **Exports:** `leads.csv` per campaign (with status), `suppression.csv` and `sends.csv` (send log). Timestamps are UTC.
 - **Health:** `GET /health` returns `{"status":"ok","worker_last_tick":"...","worker_ok":true,"mailboxes_active":N}`. `worker_ok` is false if the worker hasn't ticked within 3 × `WORKER_TICK_SECONDS`.
 - **Logs:** `docker compose logs -f worker`.
-- **Tests:** `pip install -r requirements-dev.txt && python -m unittest discover -s tests -v` (they use a local aiosmtpd SMTP server and a fake IMAP).
+- **Tests:** `pip install -r requirements-dev.txt && python -m unittest discover -s tests -v` (they use a local aiosmtpd SMTP server, a fake IMAP, and a fake OpenAI-compatible HTTP server for the optional AI layer — no test ever calls a real provider).
 - **Limitations:** one owner login (no multi-user). No inbox or reply-from-app: replies show as snippets only. No OAuth. The send window uses whole hours. Daily caps reset at midnight in the container's timezone (UTC by default). Removing an address from suppression doesn't automatically requeue leads that were already stopped.

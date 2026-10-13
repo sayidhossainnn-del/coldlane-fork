@@ -385,6 +385,7 @@ def campaign_stats(conn, campaign_id):
         "replied": counts["replied"],
         "bounced": counts["bounced"],
         "unsubscribed": counts["unsubscribed"],
+        "meetings": meeting_count(conn, campaign_id),
         "queued": counts["queued"],
         "active": counts["active"],
         "statuses": counts,
@@ -442,7 +443,9 @@ def list_threads(conn, limit=50, offset=0, filter="all"):  # noqa: A002 - matche
 
     Each row carries: lead_id, lead_email, lead_status, campaign_id, campaign_name,
     mailbox_id, mailbox_email, last_message_at, last_kind, last_direction,
-    last_snippet, unread_count.
+    last_snippet, unread_count, plus the optional AI labels (ai_sentiment, ai_intent,
+    ai_meeting_intent, ai_summary; NULL until the thread has been classified) and the
+    manual meeting flag (meeting_booked_at, meeting_note).
 
     `filter` is one of "all", "replied" (lead status == replied), or "unread"
     (lead has at least one unread inbound message).
@@ -469,10 +472,18 @@ def list_threads(conn, limit=50, offset=0, filter="all"):  # noqa: A002 - matche
             last.direction AS last_direction,
             COALESCE(SUBSTR(last.body, 1, 300), '') AS last_snippet,
             (SELECT COUNT(*) FROM messages mu WHERE mu.lead_id = l.id
-                AND mu.direction='in' AND mu.is_read=0) AS unread_count
+                AND mu.direction='in' AND mu.is_read=0) AS unread_count,
+            ta.sentiment AS ai_sentiment,
+            ta.intent AS ai_intent,
+            ta.meeting_intent AS ai_meeting_intent,
+            ta.summary AS ai_summary,
+            lm.booked_at AS meeting_booked_at,
+            lm.note AS meeting_note
         FROM leads l
         JOIN campaigns c ON c.id = l.campaign_id
         LEFT JOIN mailboxes mb ON mb.id = l.mailbox_id
+        LEFT JOIN thread_ai ta ON ta.lead_id = l.id
+        LEFT JOIN lead_meetings lm ON lm.lead_id = l.id
         JOIN (
             SELECT m1.lead_id, m1.received_at, m1.kind, m1.direction, m1.body
             FROM messages m1
@@ -540,3 +551,125 @@ def backfill_sent_messages(conn):
         if new_id:
             created += 1
     return created
+
+
+# ---------------------------------------------------------------- optional AI layer
+# Rule-based lead scoring plus the small read/write helpers the AI endpoints and the
+# worker need. Nothing in here sends anything: AI produces labels and draft text only.
+AI_SENTIMENTS = ("positive", "neutral", "negative")
+AI_INTENTS = ("interested", "not_interested", "question", "out_of_office", "referral",
+              "unsubscribe", "other")
+REPLY_KINDS = ("reply", "auto_reply")
+SCORE_REPLIED = 40
+SCORE_SENTIMENT = {"positive": 25, "neutral": 5, "negative": -30}
+SCORE_MEETING_INTENT = 15
+SCORE_MEETING_BOOKED = 20
+SCORE_FORCE_ZERO = ("bounced", "unsubscribed")
+SCORE_MAX = 100
+
+
+def score_lead(status=None, sentiment=None, meeting_intent=0, meeting_booked=False):
+    """0-100 lead score from plain rules -- no LLM is involved (formula in README).
+
+    replied +40, sentiment positive +25 / neutral +5 / negative -30, meeting intent
+    +15, meeting booked +20. A bounced or unsubscribed lead is forced to 0. Clamped.
+    """
+    if status in SCORE_FORCE_ZERO:
+        return 0
+    score = SCORE_REPLIED if status == "replied" else 0
+    score += SCORE_SENTIMENT.get(sentiment or "", 0)
+    score += SCORE_MEETING_INTENT if meeting_intent else 0
+    score += SCORE_MEETING_BOOKED if meeting_booked else 0
+    return max(0, min(SCORE_MAX, score))
+
+
+def llm_settings(conn):
+    """The single provider-settings row as a dict (blank defaults until something is saved)."""
+    row = conn.execute("SELECT * FROM llm_settings WHERE id=1").fetchone()
+    if row is None:
+        return {"id": 1, "base_url": "", "api_key_enc": None, "model": "",
+                "draft_system_prompt": "", "enabled": 0, "updated_at": None}
+    return dict(row)
+
+
+def llm_configured(conn):
+    """True only while AI is switched on *and* usable. The key stays optional so local
+    OpenAI-compatible servers (Ollama, LM Studio, ...) work with a base URL alone."""
+    settings = llm_settings(conn)
+    return bool(settings["enabled"] and (settings["base_url"] or "").strip()
+                and (settings["model"] or "").strip())
+
+
+def thread_ai(conn, lead_id):
+    """The stored classification for a thread, or None when it was never classified."""
+    row = conn.execute("SELECT * FROM thread_ai WHERE lead_id=?", (lead_id,)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def save_thread_ai(conn, lead_id, sentiment=None, intent=None, meeting_intent=0, summary=None,
+                   message_id=None, model=None, at=None):
+    """Upsert the latest classification for a thread."""
+    conn.execute(
+        "INSERT INTO thread_ai(lead_id, sentiment, intent, meeting_intent, summary, "
+        "classified_message_id, model, updated_at) VALUES(?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(lead_id) DO UPDATE SET sentiment=excluded.sentiment, intent=excluded.intent, "
+        "meeting_intent=excluded.meeting_intent, summary=excluded.summary, "
+        "classified_message_id=excluded.classified_message_id, model=excluded.model, "
+        "updated_at=excluded.updated_at",
+        (lead_id, sentiment, intent, 1 if meeting_intent else 0, summary, message_id, model,
+         ts(at or utcnow())),
+    )
+
+
+def lead_meeting(conn, lead_id):
+    row = conn.execute("SELECT * FROM lead_meetings WHERE lead_id=?", (lead_id,)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def set_meeting(conn, lead_id, note="", at=None):
+    """Manual 'a meeting was booked' flag. Re-posting keeps the original booked_at and
+    only refreshes the note; nothing here books, sends or schedules anything."""
+    conn.execute(
+        "INSERT INTO lead_meetings(lead_id, booked_at, note) VALUES(?,?,?) "
+        "ON CONFLICT(lead_id) DO UPDATE SET note=excluded.note",
+        (lead_id, ts(at or utcnow()), (note or "").strip()[:500]),
+    )
+
+
+def clear_meeting(conn, lead_id):
+    return conn.execute("DELETE FROM lead_meetings WHERE lead_id=?", (lead_id,)).rowcount
+
+
+def meeting_count(conn, campaign_id):
+    return conn.execute(
+        "SELECT COUNT(*) FROM lead_meetings mm JOIN leads l ON l.id = mm.lead_id "
+        "WHERE l.campaign_id=?", (campaign_id,),
+    ).fetchone()[0]
+
+
+def latest_inbound_message(conn, lead_id, kinds=REPLY_KINDS):
+    """The newest inbound message worth classifying (a human reply or an auto-reply)."""
+    marks = ",".join("?" for _ in kinds)
+    return conn.execute(
+        f"SELECT * FROM messages WHERE lead_id=? AND direction='in' AND kind IN ({marks}) "
+        "ORDER BY received_at DESC, id DESC LIMIT 1", (lead_id, *kinds),
+    ).fetchone()
+
+
+def unclassified_replies(conn, limit=5):
+    """Threads whose newest inbound human reply still needs classifying, oldest first.
+
+    One message per thread (a classification describes the whole thread), skipping threads
+    whose newest reply was already classified and any message that already failed 3 times.
+    """
+    return conn.execute(
+        "SELECT m.* FROM messages m "
+        "JOIN (SELECT lead_id, MAX(id) AS newest_id FROM messages "
+        "      WHERE direction='in' AND kind='reply' GROUP BY lead_id) newest "
+        "  ON newest.newest_id = m.id "
+        "LEFT JOIN thread_ai ta ON ta.lead_id = m.lead_id "
+        "LEFT JOIN ai_attempts a ON a.message_id = m.id "
+        "WHERE (ta.classified_message_id IS NULL OR ta.classified_message_id < m.id) "
+        "AND COALESCE(a.attempts, 0) < 3 "
+        "ORDER BY m.id LIMIT ?", (limit,),
+    ).fetchall()

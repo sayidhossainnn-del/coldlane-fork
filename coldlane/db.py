@@ -196,6 +196,46 @@ CREATE TABLE IF NOT EXISTS lead_step_variant (
     variant_id INTEGER,
     PRIMARY KEY (lead_id, step_id)
 );
+
+-- --------------------------------------------------------------- optional AI layer
+-- A single row of OpenAI-compatible provider settings (Gemini, OpenAI, OpenRouter,
+-- Groq, ... all work with just a base URL change). The API key is encrypted with the
+-- same crypto as mailbox passwords; it is never serialized back to a client.
+-- `enabled` is the master switch: while it is 0 every AI endpoint answers 409 and the
+-- worker makes no provider calls at all.
+CREATE TABLE IF NOT EXISTS llm_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    base_url TEXT NOT NULL DEFAULT '',
+    api_key_enc TEXT,
+    model TEXT NOT NULL DEFAULT '',
+    draft_system_prompt TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+-- Latest classification per thread (labels + summary only; AI never sends).
+CREATE TABLE IF NOT EXISTS thread_ai (
+    lead_id INTEGER PRIMARY KEY,
+    sentiment TEXT,
+    intent TEXT,
+    meeting_intent INTEGER NOT NULL DEFAULT 0,
+    summary TEXT,
+    classified_message_id INTEGER,
+    model TEXT,
+    updated_at TEXT NOT NULL
+);
+-- Failure counter that caps automatic re-classification of one message at 3 tries.
+CREATE TABLE IF NOT EXISTS ai_attempts (
+    message_id INTEGER PRIMARY KEY,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    updated_at TEXT NOT NULL
+);
+-- Manual "a meeting was booked" flag. Purely human-set: nothing here books anything.
+CREATE TABLE IF NOT EXISTS lead_meetings (
+    lead_id INTEGER PRIMARY KEY,
+    booked_at TEXT NOT NULL,
+    note TEXT
+);
 """
 
 

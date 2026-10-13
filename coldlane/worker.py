@@ -1,10 +1,15 @@
-"""Worker service: `python -m coldlane.worker`. Send loop + IMAP poll + heartbeat."""
+"""Worker service: `python -m coldlane.worker`. Send loop + IMAP poll + heartbeat.
+
+After each IMAP poll it also runs the optional AI auto-classifier (at most 5 unclassified
+replies per tick, best effort). That step never raises, never blocks sending or polling,
+and does nothing at all while the LLM is not enabled -- see ``coldlane/ai.py``.
+"""
 import signal
 import sys
 import time
 import traceback
 
-from . import config, core, crypto, db, engine
+from . import ai, config, core, crypto, db, engine
 
 _running = {"value": True}
 
@@ -56,8 +61,10 @@ def main():
         conn = db.connect()
         try:
             sent, polled = engine.tick(conn)
-            if sent or polled:
-                print(f"{core.ts(core.utcnow())} tick: sent={sent} imap_messages={polled}", flush=True)
+            classified = ai.auto_classify(conn)
+            if sent or polled or classified:
+                print(f"{core.ts(core.utcnow())} tick: sent={sent} imap_messages={polled} "
+                      f"ai_classified={classified}", flush=True)
         except Exception:  # noqa: BLE001
             traceback.print_exc()
         finally:

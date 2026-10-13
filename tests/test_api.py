@@ -422,7 +422,9 @@ class TestApiCampaignsAndStats(ApiBase):
             "VALUES(?, 'unsub1@example.test', '{}', 'unsubscribed', 'tok-u', ?)", (campaign_id, now))
 
         stats = self.api("get", "/api/stats").get_json()
-        self.assertEqual(stats["total"], {"sent": 1, "replied": 1, "bounced": 1, "unsubscribed": 1})
+        # `meetings` rides along in the same totals block (no meeting booked here).
+        self.assertEqual(stats["total"], {"sent": 1, "replied": 1, "bounced": 1, "unsubscribed": 1,
+                                          "meetings": 0})
         entry = stats["campaigns"][0]
         self.assertEqual(entry["campaign_id"], campaign_id)
         self.assertEqual((entry["sent"], entry["replied"], entry["bounced"], entry["unsubscribed"]),
