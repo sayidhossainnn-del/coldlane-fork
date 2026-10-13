@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   Plus,
@@ -7,22 +7,39 @@ import {
   Pause,
   Play,
   Trash2,
-  Copy,
   ArrowUpRight,
 } from "lucide-react";
 import Topbar from "../components/Topbar";
 import { Card, PrimaryButton, ProgressBar, StatusBadge } from "../components/ui";
-import { campaigns as initialCampaigns, type CampaignStatus } from "../data/mock";
+import { type Campaign, type CampaignStatus } from "../data/mock";
 import NewCampaignModal from "../components/NewCampaignModal";
+import * as api from "../lib/api";
 
 const tabs: ("All" | CampaignStatus)[] = ["All", "Active", "Paused", "Draft", "Completed"];
 
 export default function Campaigns() {
-  const [campaigns, setCampaigns] = useState(initialCampaigns);
+  const [campaigns, setCampaigns] = useState<Campaign[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [tab, setTab] = useState<(typeof tabs)[number]>("All");
   const [query, setQuery] = useState("");
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [showNew, setShowNew] = useState(false);
+  const [busyId, setBusyId] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    setLoadError(null);
+    api
+      .listCampaigns()
+      .then(setCampaigns)
+      .catch((err) => setLoadError(err instanceof Error ? err.message : "Could not load campaigns."))
+      .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
 
   const filtered = useMemo(() => {
     return campaigns.filter((c) => {
@@ -32,35 +49,53 @@ export default function Campaigns() {
     });
   }, [campaigns, tab, query]);
 
-  function toggleStatus(id: string) {
-    setCampaigns((prev) =>
-      prev.map((c) =>
-        c.id === id ? { ...c, status: c.status === "Active" ? "Paused" : c.status === "Paused" ? "Active" : c.status } : c
-      )
-    );
-    setOpenMenu(null);
+  function replace(id: string, patch: Partial<Campaign>) {
+    setCampaigns((prev) => prev.map((c) => (c.id === id ? { ...c, ...patch } : c)));
   }
 
-  function duplicate(id: string) {
-    const original = campaigns.find((c) => c.id === id);
-    if (!original) return;
-    setCampaigns((prev) => [
-      { ...original, id: `${id}-copy-${Date.now()}`, name: `${original.name} (Copy)`, status: "Draft" },
-      ...prev,
-    ]);
-    setOpenMenu(null);
+  /** Active -> pause. Draft/Paused -> start (the server validates and answers with details). */
+  function toggleStatus(campaign: Campaign) {
+    setBusyId(campaign.id);
+    const request = campaign.rawStatus === "active" ? api.pauseCampaign(campaign.id) : api.startCampaign(campaign.id);
+    request
+      .then((result) => {
+        replace(campaign.id, {
+          status: api.campaignStatusLabel(result.status as api.RawCampaign["status"]),
+          rawStatus: result.status as Campaign["rawStatus"],
+        });
+        api.toast(result.status === "active" ? "Campaign started." : "Campaign paused.", "success");
+        load();
+      })
+      .catch((err) => api.toastError(err))
+      .finally(() => {
+        setBusyId(null);
+        setOpenMenu(null);
+      });
   }
 
-  function remove(id: string) {
-    setCampaigns((prev) => prev.filter((c) => c.id !== id));
-    setOpenMenu(null);
+  function remove(campaign: Campaign) {
+    if (!window.confirm(`Delete the campaign "${campaign.name}"? This cannot be undone.`)) return;
+    setBusyId(campaign.id);
+    api
+      .deleteCampaign(campaign.id)
+      .then(() => {
+        setCampaigns((prev) => prev.filter((c) => c.id !== campaign.id));
+        api.toast("Campaign deleted.", "success");
+      })
+      .catch((err) => api.toastError(err))
+      .finally(() => {
+        setBusyId(null);
+        setOpenMenu(null);
+      });
   }
+
+  const activeCount = campaigns.filter((c) => c.status === "Active").length;
 
   return (
     <>
       <Topbar
         title="Campaigns"
-        subtitle={`${campaigns.length} campaigns · ${campaigns.filter((c) => c.status === "Active").length} active`}
+        subtitle={`${campaigns.length} campaigns · ${activeCount} active`}
         actions={
           <PrimaryButton icon={Plus} onClick={() => setShowNew(true)}>
             New Campaign
@@ -95,6 +130,15 @@ export default function Campaigns() {
           </div>
         </Card>
 
+        {loading && <p className="text-sm text-slate-400">Loading campaigns…</p>}
+        {loadError && (
+          <Card className="border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">
+            <p>{loadError}</p>
+            <button onClick={load} className="mt-1 font-semibold underline">Retry</button>
+          </Card>
+        )}
+
+        {!loadError && (
         <Card className="overflow-visible">
           <div className="overflow-x-auto">
             <table className="w-full min-w-[920px] text-left text-sm">
@@ -119,7 +163,8 @@ export default function Campaigns() {
                         {c.name}
                         <ArrowUpRight size={13} className="text-slate-300" />
                       </Link>
-                      <p className="mt-0.5 text-xs text-slate-400">{c.leads.toLocaleString()} leads &middot; {c.accounts.length} sender{c.accounts.length > 1 ? "s" : ""}</p>
+                      {/* TODO(feature): sender count in the list — only GET /api/campaigns/{id} returns mailboxes */}
+                      <p className="mt-0.5 text-xs text-slate-400">{c.leads.toLocaleString()} leads</p>
                     </td>
                     <td className="px-3 py-4">
                       <StatusBadge status={c.status} />
@@ -134,13 +179,17 @@ export default function Campaigns() {
                     </td>
                     <td className="px-3 py-4 text-right font-medium text-slate-700">{c.sent.toLocaleString()}</td>
                     <td className="px-3 py-4 text-right text-slate-500">
-                      {c.sent ? `${((c.opens / c.sent) * 100).toFixed(1)}%` : "—"}
+                      {/* TODO(feature): opens and open rate — ColdLane tracks no opens */}
+                      —
                     </td>
                     <td className="px-3 py-4 text-right text-slate-500">
                       {c.sent ? `${((c.replies / c.sent) * 100).toFixed(1)}%` : "—"}
                     </td>
-                    <td className="px-3 py-4 text-right font-medium text-emerald-600">{c.interested}</td>
-                    <td className="px-3 py-4 text-right text-xs text-slate-400">{c.createdAt}</td>
+                    <td className="px-3 py-4 text-right text-slate-500">
+                      {/* TODO(feature): "interested" counter — the API reports replies, not interest */}
+                      —
+                    </td>
+                    <td className="px-3 py-4 text-right text-xs text-slate-400">{api.formatDate(c.createdAt)}</td>
                     <td className="relative px-3 py-4 text-right">
                       <button
                         onClick={() => setOpenMenu(openMenu === c.id ? null : c.id)}
@@ -150,25 +199,21 @@ export default function Campaigns() {
                       </button>
                       {openMenu === c.id && (
                         <div className="absolute right-4 top-12 z-20 w-44 overflow-hidden rounded-xl border border-slate-200 bg-white py-1 text-left shadow-lg">
-                          {c.status !== "Draft" && c.status !== "Completed" && (
+                          {c.status !== "Completed" && (
                             <button
-                              onClick={() => toggleStatus(c.id)}
-                              className="flex w-full items-center gap-2 px-3 py-2 text-sm text-slate-600 hover:bg-slate-50"
+                              onClick={() => toggleStatus(c)}
+                              disabled={busyId === c.id}
+                              className="flex w-full items-center gap-2 px-3 py-2 text-sm text-slate-600 hover:bg-slate-50 disabled:opacity-60"
                             >
                               {c.status === "Active" ? <Pause size={14} /> : <Play size={14} />}
-                              {c.status === "Active" ? "Pause" : "Resume"}
+                              {c.status === "Active" ? "Pause" : "Start"}
                             </button>
                           )}
+                          {/* TODO(feature): duplicate campaign — no endpoint for it */}
                           <button
-                            onClick={() => duplicate(c.id)}
-                            className="flex w-full items-center gap-2 px-3 py-2 text-sm text-slate-600 hover:bg-slate-50"
-                          >
-                            <Copy size={14} />
-                            Duplicate
-                          </button>
-                          <button
-                            onClick={() => remove(c.id)}
-                            className="flex w-full items-center gap-2 px-3 py-2 text-sm text-rose-600 hover:bg-rose-50"
+                            onClick={() => remove(c)}
+                            disabled={busyId === c.id}
+                            className="flex w-full items-center gap-2 px-3 py-2 text-sm text-rose-600 hover:bg-rose-50 disabled:opacity-60"
                           >
                             <Trash2 size={14} />
                             Delete
@@ -178,7 +223,7 @@ export default function Campaigns() {
                     </td>
                   </tr>
                 ))}
-                {filtered.length === 0 && (
+                {filtered.length === 0 && !loading && (
                   <tr>
                     <td colSpan={9} className="px-5 py-14 text-center text-sm text-slate-400">
                       No campaigns match your search.
@@ -189,8 +234,17 @@ export default function Campaigns() {
             </table>
           </div>
         </Card>
+        )}
       </main>
-      {showNew && <NewCampaignModal onClose={() => setShowNew(false)} />}
+      {showNew && (
+        <NewCampaignModal
+          onClose={() => setShowNew(false)}
+          onCreated={() => {
+            setShowNew(false);
+            load();
+          }}
+        />
+      )}
     </>
   );
 }

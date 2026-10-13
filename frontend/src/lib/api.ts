@@ -726,6 +726,8 @@ export interface CampaignDetailResponse {
   mailboxes: RawMailbox[];
   stats: CampaignStats;
   start_errors: string[];
+  /** Present on PUT: positions the server refused to rewrite because they already sent. */
+  locked_steps?: number[];
 }
 
 export function getCampaign(id: string) {
