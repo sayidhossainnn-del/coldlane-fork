@@ -15,6 +15,8 @@ FINAL_RCPT_RE = re.compile(r"^(?:Final|Original)-Recipient:\s*[^;]*;\s*<?([^\s>]
 STATUS_LINE_RE = re.compile(r"^Status:\s*([245]\.\d{1,3}\.\d{1,3})", re.I | re.M)
 MSGID_RE = re.compile(r"<[^<>\s]+>")
 OPTOUT_PHRASES = {"unsubscribe", "remove me", "remove", "stop", "unsubscribe me", "please remove me"}
+# Matches the common mail-client quoting preamble, e.g. "On Mon, Jan 1, 2024 at 3:00 PM Jane Doe wrote:"
+ON_WROTE_RE = re.compile(r"^\s*On .{0,300}?wrote:\s*$")
 
 
 # ================================================================ send window
@@ -76,12 +78,15 @@ def _schedule_gap(conn, mb_id, now):
                  (core.ts(now + dt.timedelta(seconds=gap)), mb_id))
 
 
-def _record_send(conn, lead, step, mb, message_id, now, status, result, attempt):
+def _record_send(conn, lead, step, mb, message_id, now, status, result, attempt, subject=None, body=None):
+    """Insert the `sends` bookkeeping row. `subject`/`body` are only populated for
+    emails that were actually accepted by SMTP (status='sent'); failed attempts keep
+    them NULL since nothing was actually delivered."""
     conn.execute(
         "INSERT INTO sends(campaign_id, lead_id, step_id, step_pos, mailbox_id, recipient, recipient_domain, "
-        "message_id, sent_at, status, smtp_result, attempt) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        "message_id, sent_at, status, smtp_result, attempt, subject, body) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (lead["campaign_id"], lead["id"], step["id"], step["position"], mb["id"], lead["email"],
-         core.domain_of(lead["email"]), message_id, core.ts(now), status, result, attempt),
+         core.domain_of(lead["email"]), message_id, core.ts(now), status, result, attempt, subject, body),
     )
 
 
@@ -211,7 +216,25 @@ def try_send_lead(conn, campaign, steps, lead_id, now):
         return False
 
     # Success
-    _record_send(conn, lead, step, mb, message_id, now, "sent", result, attempt)
+    _record_send(conn, lead, step, mb, message_id, now, "sent", result, attempt, subject=subject, body=body)
+    db.insert_message(
+        conn,
+        lead_id=lead["id"],
+        campaign_id=lead["campaign_id"],
+        mailbox_id=mb["id"],
+        direction="out",
+        kind="sent",
+        message_id=message_id,
+        in_reply_to=in_reply_to,
+        references_hdr=references,
+        from_email=mb["from_email"],
+        to_email=lead["email"],
+        subject=subject,
+        body=body,
+        received_at=core.ts(now),
+        imap_uid=None,
+        is_read=1,
+    )
     new_step = lead["current_step"] + 1
     status = "completed" if new_step >= len(steps) else "active"
     refs = ((lead["thread_refs"] or "") + " " + message_id).strip()
@@ -271,7 +294,7 @@ def _text_body(msg):
             return ""
         content = part.get_content()
         if part.get_content_type() == "text/html":
-            content = re.sub(r"<[^>]+>", " ", content)
+            content = mailer.html_to_text(content)
         return content
     except Exception:  # noqa: BLE001
         return ""
@@ -288,6 +311,30 @@ def _snippet(text):
     return re.sub(r"\s+", " ", " ".join(lines)).strip()[:300]
 
 
+def _strip_quoted(text):
+    """Best-effort removal of quoted reply history for full-body storage: drops lines
+    starting with '>' and anything from a common "On ... wrote:" preamble onward.
+    Only trims when a quote marker is actually found; otherwise the original text is
+    returned untouched so content is never silently lost."""
+    if not text:
+        return text
+    lines = text.splitlines()
+    out = []
+    found_quote = False
+    for line in lines:
+        if line.strip().startswith(">"):
+            found_quote = True
+            continue
+        if ON_WROTE_RE.match(line):
+            found_quote = True
+            break
+        out.append(line)
+    if not found_quote:
+        return text
+    cleaned = "\n".join(out).rstrip()
+    return cleaned if cleaned.strip() else text
+
+
 def _msgids(value):
     return MSGID_RE.findall(value or "")
 
@@ -295,8 +342,12 @@ def _msgids(value):
 def parse_incoming(raw):
     msg = email.message_from_bytes(raw, policy=policy.default)
     from_addr = parseaddr(str(msg.get("From", "")))[1].lower()
+    to_addr = parseaddr(str(msg.get("To", "")))[1].lower()
     local = from_addr.split("@")[0]
-    ids = _msgids(str(msg.get("In-Reply-To", ""))) + _msgids(str(msg.get("References", "")))
+    message_id_hdr = str(msg.get("Message-ID", "")).strip() or None
+    in_reply_to_hdr = str(msg.get("In-Reply-To", "")).strip() or None
+    references_hdr = str(msg.get("References", "")).strip() or None
+    ids = _msgids(in_reply_to_hdr or "") + _msgids(references_hdr or "")
     auto = False
     auto_sub = str(msg.get("Auto-Submitted", "")).strip().lower()
     if auto_sub and auto_sub != "no":
@@ -340,13 +391,18 @@ def parse_incoming(raw):
     body = _text_body(msg)
     return {
         "from": from_addr,
+        "to": to_addr,
         "subject": str(msg.get("Subject", "")),
+        "message_id": message_id_hdr,
+        "in_reply_to": in_reply_to_hdr,
+        "references": references_hdr,
         "ids": ids,
         "auto_reply": auto,
         "is_bounce": is_dsn or is_daemon,
         "dsn": dsn,
         "original_ids": original_ids,
         "body": body,
+        "clean_body": _strip_quoted(body),
         "snippet": _snippet(body),
         "raw_text": msg.as_string() if (is_dsn or is_daemon) else "",
     }
@@ -371,12 +427,40 @@ def _lead_by_from(conn, address, statuses=("active", "queued", "completed")):
     ).fetchone()
 
 
-def process_incoming(conn, raw, mailbox_id=None):
+def _store_inbound(conn, mailbox_id, lead, info, kind, imap_uid, now):
+    """Persist the full inbound message for the unibox. Uses the quote-stripped body
+    when available, falling back to the raw body so content is never lost."""
+    body = info.get("clean_body")
+    if body is None or body == "":
+        body = info.get("body") or ""
+    db.insert_message(
+        conn,
+        lead_id=lead["id"] if lead else None,
+        campaign_id=lead["campaign_id"] if lead else None,
+        mailbox_id=mailbox_id,
+        direction="in",
+        kind=kind,
+        message_id=info.get("message_id"),
+        in_reply_to=info.get("in_reply_to"),
+        references_hdr=info.get("references"),
+        from_email=info.get("from"),
+        to_email=info.get("to"),
+        subject=info.get("subject"),
+        body=body,
+        received_at=core.ts(now),
+        imap_uid=imap_uid,
+        is_read=0,
+    )
+
+
+def process_incoming(conn, raw, mailbox_id=None, imap_uid=None, now=None):
     """Classify one inbound message and apply stop rules. Returns a short classification string."""
+    now = now or core.utcnow()
     info = parse_incoming(raw)
     if info["is_bounce"]:
         results = []
         pairs = list(info["dsn"])
+        matched_lead = None
         if not pairs and info["original_ids"]:
             lead = _lead_by_message_ids(conn, info["original_ids"])
             codes = DSN_STATUS_RE.findall(info["raw_text"])
@@ -393,6 +477,8 @@ def process_incoming(conn, raw, mailbox_id=None):
                                 (addr,)).fetchone()
             if lead is None:
                 continue
+            if matched_lead is None:
+                matched_lead = lead
             if status.startswith("5"):
                 core.add_suppression(conn, email=addr, source="bounce", note=f"DSN {status}")
                 changed = core.stop_address(conn, addr, "bounced", detail=f"DSN {status}")
@@ -402,6 +488,7 @@ def process_incoming(conn, raw, mailbox_id=None):
             else:
                 core.log_event(conn, "bounce_soft", f"DSN {status} (logged only)", lead["id"], lead["campaign_id"], addr)
                 results.append(f"bounce_soft:{addr}")
+        _store_inbound(conn, mailbox_id, matched_lead, info, "bounce", imap_uid, now)
         return ",".join(results) or "bounce_unmatched"
 
     lead = _lead_by_message_ids(conn, info["ids"]) or _lead_by_from(conn, info["from"])
@@ -410,14 +497,17 @@ def process_incoming(conn, raw, mailbox_id=None):
     if info["auto_reply"]:
         core.log_event(conn, "auto_reply", json.dumps({"subject": info["subject"], "snippet": info["snippet"]}),
                        lead["id"], lead["campaign_id"], lead["email"])
+        _store_inbound(conn, mailbox_id, lead, info, "auto_reply", imap_uid, now)
         return "auto_reply"
     stripped = re.sub(r"[\s.!]+", " ", info["snippet"]).strip().lower()
     subject_l = info["subject"].strip().lower()
     if stripped in OPTOUT_PHRASES or (subject_l == "unsubscribe" and len(stripped) < 40):
         core.add_suppression(conn, email=lead["email"], source="reply_optout", note="opt-out reply")
         core.stop_address(conn, lead["email"], "unsubscribed", detail="opt-out reply")
+        _store_inbound(conn, mailbox_id, lead, info, "optout", imap_uid, now)
         return "unsubscribe"
     changed = core.stop_address(conn, lead["email"], "replied", detail=info["subject"][:200], snippet=info["snippet"])
+    _store_inbound(conn, mailbox_id, lead, info, "reply", imap_uid, now)
     if not changed and lead["status"] == "replied":
         return "reply_duplicate"
     return "reply"
@@ -448,6 +538,7 @@ def poll_mailbox(conn, mb):
         for uid in uids:
             if last_uid is not None and uid <= int(last_uid):
                 continue
+            # BODY.PEEK[] never sets \Seen and nothing is ever deleted: the poll stays read-only.
             typ, fetched = client.uid("FETCH", str(uid), "(BODY.PEEK[])")
             raw = None
             for item in fetched or []:
@@ -455,7 +546,7 @@ def poll_mailbox(conn, mb):
                     raw = item[1]
                     break
             if raw:
-                process_incoming(conn, raw, mb["id"])
+                process_incoming(conn, raw, mb["id"], imap_uid=uid)
                 processed += 1
             max_uid = max(max_uid, uid)
         conn.execute("UPDATE mailboxes SET last_imap_uid=?, imap_uidvalidity=COALESCE(?, imap_uidvalidity) WHERE id=?",

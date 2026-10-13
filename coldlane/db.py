@@ -135,6 +135,43 @@ CREATE INDEX IF NOT EXISTS idx_supp_email ON suppression(email);
 CREATE INDEX IF NOT EXISTS idx_supp_domain ON suppression(domain);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS worker_state (key TEXT PRIMARY KEY, value TEXT);
+
+-- ---------------------------------------------------------------- unibox storage
+-- Full message bodies for the external dashboard's unified inbox. `sends` keeps
+-- aggregate send bookkeeping (caps, throttling, status); `messages` is the
+-- append-only, full-content record of every outbound and inbound email so a
+-- thread view can be rendered without re-touching the mail servers.
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id INTEGER,
+    campaign_id INTEGER,
+    mailbox_id INTEGER,
+    direction TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    message_id TEXT,
+    in_reply_to TEXT,
+    references_hdr TEXT,
+    from_email TEXT,
+    to_email TEXT,
+    subject TEXT,
+    body TEXT,
+    received_at TEXT NOT NULL,
+    imap_uid INTEGER,
+    is_read INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_messages_lead ON messages(lead_id, received_at);
+CREATE INDEX IF NOT EXISTS idx_messages_mailbox_uid ON messages(mailbox_id, imap_uid);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_mailbox_msgid
+    ON messages(mailbox_id, message_id) WHERE message_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS templates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    subject TEXT,
+    body TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -147,6 +184,22 @@ def connect(path=None):
     return conn
 
 
+def _column_names(conn, table):
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate(conn):
+    """Guarded ALTER TABLEs for databases created before a schema change. Idempotent:
+    safe to run on every startup, never touches existing data."""
+    # `sends` gained `subject`/`body` so the final rendered outbound content can be
+    # reconstructed even for rows written before the `messages` table existed.
+    sends_cols = _column_names(conn, "sends")
+    if "subject" not in sends_cols:
+        conn.execute("ALTER TABLE sends ADD COLUMN subject TEXT")
+    if "body" not in sends_cols:
+        conn.execute("ALTER TABLE sends ADD COLUMN body TEXT")
+
+
 def init_db(path=None):
     path = path or config.db_path()
     directory = os.path.dirname(os.path.abspath(path))
@@ -154,6 +207,7 @@ def init_db(path=None):
     conn = connect(path)
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
     finally:
         conn.close()
 
@@ -187,3 +241,24 @@ def set_state(conn, key, value):
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (key, str(value)),
     )
+
+
+# ---------------------------------------------------------------- messages (unibox)
+def insert_message(conn, *, lead_id=None, campaign_id=None, mailbox_id=None, direction, kind,
+                   message_id=None, in_reply_to=None, references_hdr=None,
+                   from_email=None, to_email=None, subject=None, body=None,
+                   received_at, imap_uid=None, is_read=0):
+    """Insert one full message row (outbound or inbound).
+
+    Uses INSERT OR IGNORE so re-processing the same physical email (matched by
+    the unique (mailbox_id, message_id) index) can never create a duplicate row;
+    this is what makes IMAP re-polls and worker restarts safe.
+    """
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO messages(lead_id, campaign_id, mailbox_id, direction, kind, message_id, "
+        "in_reply_to, references_hdr, from_email, to_email, subject, body, received_at, imap_uid, is_read) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (lead_id, campaign_id, mailbox_id, direction, kind, message_id, in_reply_to, references_hdr,
+         from_email, to_email, subject, body, received_at, imap_uid, is_read),
+    )
+    return cur.lastrowid

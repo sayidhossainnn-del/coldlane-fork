@@ -8,9 +8,32 @@ from . import config, core, crypto, db, engine
 
 _running = {"value": True}
 
+# Settings key guarding the one-off `messages` backfill so it only ever runs once
+# per database, even across worker restarts.
+BACKFILL_SETTING_KEY = "messages_backfill_done"
+
 
 def _stop(signum, frame):  # noqa: ARG001
     _running["value"] = False
+
+
+def _run_backfill_once(conn):
+    """Populate `messages` rows for historical `sends` on first startup after the
+    unibox storage upgrade. Idempotent: guarded by a settings flag plus the
+    (mailbox_id, message_id) unique index on `messages`, so it is always safe to
+    call, even if the flag write races across multiple worker starts."""
+    if db.get_setting(conn, BACKFILL_SETTING_KEY) == "1":
+        return
+    try:
+        created = core.backfill_sent_messages(conn)
+        db.set_setting(conn, BACKFILL_SETTING_KEY, "1")
+        if created:
+            print(f"ColdLane worker: backfilled {created} historical sent message(s) into the messages table.",
+                  flush=True)
+    except Exception:  # noqa: BLE001
+        # Never block worker startup on a best-effort backfill; it will simply be
+        # retried on the next restart since the settings flag was not written.
+        traceback.print_exc()
 
 
 def main():
@@ -21,6 +44,11 @@ def main():
     if crypto.using_generated_key():
         print("WARNING: ENCRYPTION_KEY is not set; using an auto-generated key file next to the database. "
               "Set ENCRYPTION_KEY in .env for production.", flush=True)
+    conn = db.connect()
+    try:
+        _run_backfill_once(conn)
+    finally:
+        conn.close()
     print(f"ColdLane worker started: tick={config.tick_seconds()}s imap_poll={config.imap_poll_seconds()}s "
           f"db={config.db_path()}", flush=True)
     while _running["value"]:

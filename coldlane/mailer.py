@@ -79,6 +79,29 @@ def html_from_text(body_text, footer, unsub_url):
     )
 
 
+# ---------------------------------------------------------------- inbound HTML -> text
+# Used only when storing full inbound message bodies for the unibox (messages table):
+# a reply that only sent text/html gets converted to plain text for storage. This has
+# no effect whatsoever on outbound sending/rendering above.
+_HTML_BLOCK_RE = re.compile(r"(?i)<(?:br\s*/?|/p|/div|/tr|/li|/h[1-6])\s*>")
+_HTML_SCRIPT_STYLE_RE = re.compile(r"(?is)<(script|style)[^>]*>.*?</\1>")
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_BLANK_RUN_RE = re.compile(r"\n\s*\n\s*\n+")
+
+
+def html_to_text(content):
+    """Best-effort, dependency-free HTML -> plain text conversion for inbound storage."""
+    if not content:
+        return ""
+    text = _HTML_SCRIPT_STYLE_RE.sub(" ", content)
+    text = _HTML_BLOCK_RE.sub("\n", text)
+    text = _HTML_TAG_RE.sub(" ", text)
+    text = html.unescape(text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = _BLANK_RUN_RE.sub("\n\n", text)
+    return text.strip()
+
+
 def build_message(mb, to_email, subject, body, unsub_url, business, address,
                   in_reply_to=None, references=None, now=None):
     """Return (EmailMessage, message_id)."""

@@ -317,3 +317,122 @@ def worker_status(conn, now=None):
     last_dt = parse_ts(last) if last else None
     ok = bool(last_dt) and (now - last_dt).total_seconds() <= 3 * config.tick_seconds()
     return last, ok
+
+
+# ---------------------------------------------------------------- unibox (messages)
+# Plain data-access helpers for the future external dashboard's unified inbox. No
+# Flask routes live here; they just read/write the `messages` table (full outbound
+# and inbound content) added alongside `sends.subject`/`sends.body`.
+THREAD_FILTERS = ("all", "replied", "unread")
+
+
+def get_thread(conn, lead_id):
+    """All messages (outbound + inbound) for one lead, oldest first."""
+    return conn.execute(
+        "SELECT * FROM messages WHERE lead_id=? ORDER BY received_at, id", (lead_id,)
+    ).fetchall()
+
+
+def list_threads(conn, limit=50, offset=0, filter="all"):  # noqa: A002 - matches spec's parameter name
+    """One row per lead that has at least one stored message, most recent activity first.
+
+    Each row carries: lead_id, lead_email, lead_status, campaign_id, campaign_name,
+    mailbox_id, mailbox_email, last_message_at, last_kind, last_direction,
+    last_snippet, unread_count.
+
+    `filter` is one of "all", "replied" (lead status == replied), or "unread"
+    (lead has at least one unread inbound message).
+    """
+    if filter not in THREAD_FILTERS:
+        filter = "all"
+    extra = ""
+    if filter == "replied":
+        extra = "AND l.status = 'replied'"
+    elif filter == "unread":
+        extra = ("AND EXISTS (SELECT 1 FROM messages mu WHERE mu.lead_id = l.id "
+                "AND mu.direction='in' AND mu.is_read=0)")
+    sql = f"""
+        SELECT
+            l.id AS lead_id,
+            l.email AS lead_email,
+            l.status AS lead_status,
+            c.id AS campaign_id,
+            c.name AS campaign_name,
+            mb.id AS mailbox_id,
+            mb.from_email AS mailbox_email,
+            last.received_at AS last_message_at,
+            last.kind AS last_kind,
+            last.direction AS last_direction,
+            COALESCE(SUBSTR(last.body, 1, 300), '') AS last_snippet,
+            (SELECT COUNT(*) FROM messages mu WHERE mu.lead_id = l.id
+                AND mu.direction='in' AND mu.is_read=0) AS unread_count
+        FROM leads l
+        JOIN campaigns c ON c.id = l.campaign_id
+        LEFT JOIN mailboxes mb ON mb.id = l.mailbox_id
+        JOIN (
+            SELECT m1.lead_id, m1.received_at, m1.kind, m1.direction, m1.body
+            FROM messages m1
+            WHERE m1.id = (
+                SELECT m2.id FROM messages m2
+                WHERE m2.lead_id = m1.lead_id
+                ORDER BY m2.received_at DESC, m2.id DESC
+                LIMIT 1
+            )
+        ) last ON last.lead_id = l.id
+        WHERE 1=1 {extra}
+        ORDER BY last.received_at DESC, l.id DESC
+        LIMIT ? OFFSET ?
+    """
+    return conn.execute(sql, (limit, offset)).fetchall()
+
+
+def mark_thread_read(conn, lead_id):
+    """Mark every inbound message in a lead's thread as read. Returns rows affected."""
+    cur = conn.execute(
+        "UPDATE messages SET is_read=1 WHERE lead_id=? AND direction='in' AND is_read=0", (lead_id,)
+    )
+    return cur.rowcount
+
+
+def backfill_sent_messages(conn):
+    """One-off upgrade helper: create `messages` rows for `sends` rows that predate
+    full-content storage. Only outbound 'sent' sends are backfilled (inbound history
+    cannot be reconstructed after the fact, so it is intentionally left alone).
+
+    Subject/body will be NULL here for any `sends` row that itself has no
+    subject/body recorded (i.e. rows written before the `sends.subject`/`sends.body`
+    migration ran); those rows are still inserted so the thread's send timeline stays
+    complete, just without content. Safe to run multiple times: relies on the same
+    (mailbox_id, message_id) uniqueness as live inserts, so nothing is duplicated.
+    """
+    rows = conn.execute(
+        "SELECT s.* FROM sends s WHERE s.status='sent' AND NOT EXISTS ("
+        "SELECT 1 FROM messages m WHERE m.mailbox_id = s.mailbox_id AND m.message_id = s.message_id)"
+    ).fetchall()
+    created = 0
+    for row in rows:
+        lead = conn.execute("SELECT email FROM leads WHERE id=?", (row["lead_id"],)).fetchone()
+        to_email = lead["email"] if lead else row["recipient"]
+        mb = conn.execute("SELECT from_email FROM mailboxes WHERE id=?", (row["mailbox_id"],)).fetchone()
+        from_email = mb["from_email"] if mb else None
+        new_id = db.insert_message(
+            conn,
+            lead_id=row["lead_id"],
+            campaign_id=row["campaign_id"],
+            mailbox_id=row["mailbox_id"],
+            direction="out",
+            kind="sent",
+            message_id=row["message_id"],
+            in_reply_to=None,
+            references_hdr=None,
+            from_email=from_email,
+            to_email=to_email,
+            subject=row["subject"],
+            body=row["body"],
+            received_at=row["sent_at"],
+            imap_uid=None,
+            is_read=1,
+        )
+        if new_id:
+            created += 1
+    return created
