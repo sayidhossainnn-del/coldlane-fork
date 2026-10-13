@@ -1,122 +1,82 @@
+import { useEffect, useState } from "react";
 import Topbar from "../components/Topbar";
 import { Card, StatCard } from "../components/ui";
-import { campaigns, funnel, performanceSeries } from "../data/mock";
-import {
-  BarChart,
-  Bar,
-  ResponsiveContainer,
-  XAxis,
-  YAxis,
-  Tooltip,
-  CartesianGrid,
-  FunnelChart,
-  Funnel,
-  LabelList,
-  PieChart,
-  Pie,
-  Cell,
-  Legend,
-} from "recharts";
-import { Send, MailOpen, Reply, TrendingUp } from "lucide-react";
-
-const COLORS = ["#6366f1", "#8b5cf6", "#f59e0b", "#10b981", "#ef4444"];
-
-const campaignComparison = campaigns.map((c) => ({
-  name: c.name.split(" ").slice(0, 2).join(" "),
-  opens: c.sent ? Math.round((c.opens / c.sent) * 100) : 0,
-  replies: c.sent ? Math.round((c.replies / c.sent) * 1000) / 10 : 0,
-}));
-
-const deliverability = [
-  { name: "Inbox", value: 82 },
-  { name: "Spam", value: 6 },
-  { name: "Promotions", value: 9 },
-  { name: "Bounced", value: 3 },
-];
+import { Send, Reply } from "lucide-react";
+import * as api from "../lib/api";
 
 export default function Analytics() {
+  const [stats, setStats] = useState<api.StatsResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setLoading(true);
+    api
+      .getStats()
+      .then(setStats)
+      .catch((err) => setError(err instanceof Error ? err.message : "Could not load stats."))
+      .finally(() => setLoading(false));
+  }, []);
+
+  const total = stats?.total;
+  const replyRate = total && total.sent ? ((total.replied / total.sent) * 100).toFixed(1) : "0.0";
+
   return (
     <>
-      <Topbar title="Analytics" subtitle="Deep dive into deliverability and campaign performance" />
+      <Topbar title="Analytics" subtitle="Campaign performance reported by the ColdLane API" />
       <main className="flex-1 space-y-6 p-4 sm:p-8">
+        {loading && <p className="text-sm text-slate-400">Loading stats…</p>}
+        {error && <Card className="border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">{error}</Card>}
+
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-          <StatCard label="Total Sent (30d)" value="48,230" delta="+9.2%" icon={Send} accent="indigo" />
-          <StatCard label="Avg Open Rate" value="59.4%" delta="+2.8%" icon={MailOpen} accent="violet" />
-          <StatCard label="Avg Reply Rate" value="7.9%" delta="+0.6%" icon={Reply} accent="amber" />
-          <StatCard label="Positive Reply Rate" value="2.4%" delta="+0.3%" icon={TrendingUp} accent="emerald" />
+          <StatCard label="Total Sent" value={(total?.sent ?? 0).toLocaleString()} icon={Send} accent="indigo" />
+          {/* TODO(feature): average open rate — ColdLane tracks no opens */}
+          <StatCard label="Reply Rate" value={`${replyRate}%`} icon={Reply} accent="amber" />
+          {/* TODO(feature): positive reply rate — sentiment is per thread, not an aggregate */}
         </div>
 
-        <div className="grid grid-cols-1 gap-6 xl:grid-cols-3">
-          <Card className="p-5 xl:col-span-2">
-            <h3 className="font-semibold text-slate-900">Campaign Comparison</h3>
-            <p className="text-sm text-slate-500">Open rate (%) vs reply rate (%) by campaign</p>
-            <div className="mt-4 h-80">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={campaignComparison} margin={{ left: -20, right: 10 }}>
-                  <CartesianGrid vertical={false} stroke="#f1f5f9" />
-                  <XAxis dataKey="name" tickLine={false} axisLine={false} tick={{ fill: "#94a3b8", fontSize: 11 }} interval={0} angle={-15} textAnchor="end" height={60} />
-                  <YAxis tickLine={false} axisLine={false} tick={{ fill: "#94a3b8", fontSize: 12 }} />
-                  <Tooltip contentStyle={{ borderRadius: 12, border: "1px solid #e2e8f0", fontSize: 12 }} />
-                  <Bar dataKey="opens" fill="#6366f1" radius={[6, 6, 0, 0]} name="Open Rate %" />
-                  <Bar dataKey="replies" fill="#34d399" radius={[6, 6, 0, 0]} name="Reply Rate %" />
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          </Card>
+        {/* TODO(feature): campaign comparison chart — built on open rates, which do not exist */}
+        {/* TODO(feature): inbox placement pie — no deliverability breakdown in the API */}
+        {/* TODO(feature): weekly volume chart — no time-series in the API */}
+        {/* TODO(feature): conversion funnel — no funnel data in the API */}
 
-          <Card className="p-5">
-            <h3 className="font-semibold text-slate-900">Inbox Placement</h3>
-            <p className="text-sm text-slate-500">Where your emails are landing</p>
-            <div className="mt-2 h-72">
-              <ResponsiveContainer width="100%" height="100%">
-                <PieChart>
-                  <Pie data={deliverability} dataKey="value" nameKey="name" innerRadius={55} outerRadius={85} paddingAngle={3}>
-                    {deliverability.map((_, i) => (
-                      <Cell key={i} fill={COLORS[i % COLORS.length]} />
-                    ))}
-                  </Pie>
-                  <Tooltip contentStyle={{ borderRadius: 12, border: "1px solid #e2e8f0", fontSize: 12 }} />
-                  <Legend verticalAlign="bottom" height={30} iconSize={8} wrapperStyle={{ fontSize: 12 }} />
-                </PieChart>
-              </ResponsiveContainer>
+        {!loading && !error && stats && (
+          <Card className="overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[720px] text-left text-sm">
+                <thead>
+                  <tr className="border-b border-slate-100 text-xs uppercase tracking-wide text-slate-400">
+                    <th className="px-5 py-3 font-semibold">Campaign</th>
+                    <th className="px-3 py-3 font-semibold text-right">Sent</th>
+                    <th className="px-3 py-3 font-semibold text-right">Replied</th>
+                    <th className="px-3 py-3 font-semibold text-right">Bounced</th>
+                    <th className="px-3 py-3 font-semibold text-right">Unsubscribed</th>
+                    <th className="px-3 py-3 font-semibold text-right">Meetings</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {stats.campaigns.map((c) => (
+                    <tr key={c.campaign_id} className="border-b border-slate-50 last:border-0 hover:bg-slate-50/70">
+                      <td className="px-5 py-3 font-medium text-slate-800">{c.name}</td>
+                      <td className="px-3 py-3 text-right text-slate-600">{c.sent.toLocaleString()}</td>
+                      <td className="px-3 py-3 text-right text-slate-600">{c.replied}</td>
+                      <td className="px-3 py-3 text-right text-slate-600">{c.bounced}</td>
+                      <td className="px-3 py-3 text-right text-slate-600">{c.unsubscribed}</td>
+                      <td className="px-3 py-3 text-right font-semibold text-slate-700">{c.meetings}</td>
+                    </tr>
+                  ))}
+                  {stats.campaigns.length === 0 && (
+                    <tr>
+                      <td colSpan={6} className="px-5 py-10 text-center text-sm text-slate-400">
+                        No campaigns yet.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
             </div>
           </Card>
-        </div>
-
-        <div className="grid grid-cols-1 gap-6 xl:grid-cols-3">
-          <Card className="p-5 xl:col-span-2">
-            <h3 className="font-semibold text-slate-900">Weekly Volume</h3>
-            <div className="mt-4 h-72">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={performanceSeries} margin={{ left: -20, right: 10 }}>
-                  <CartesianGrid vertical={false} stroke="#f1f5f9" />
-                  <XAxis dataKey="day" tickLine={false} axisLine={false} tick={{ fill: "#94a3b8", fontSize: 12 }} />
-                  <YAxis tickLine={false} axisLine={false} tick={{ fill: "#94a3b8", fontSize: 12 }} />
-                  <Tooltip contentStyle={{ borderRadius: 12, border: "1px solid #e2e8f0", fontSize: 12 }} />
-                  <Bar dataKey="sent" fill="#c7d2fe" radius={[6, 6, 0, 0]} />
-                  <Bar dataKey="clicks" fill="#6366f1" radius={[6, 6, 0, 0]} />
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          </Card>
-
-          <Card className="p-5">
-            <h3 className="font-semibold text-slate-900">Conversion Funnel</h3>
-            <div className="mt-4 h-72">
-              <ResponsiveContainer width="100%" height="100%">
-                <FunnelChart>
-                  <Tooltip contentStyle={{ borderRadius: 12, border: "1px solid #e2e8f0", fontSize: 12 }} />
-                  <Funnel dataKey="value" data={funnel} isAnimationActive>
-                    {funnel.map((_, i) => (
-                      <Cell key={i} fill={COLORS[i % COLORS.length]} />
-                    ))}
-                    <LabelList position="right" dataKey="stage" stroke="none" fill="#475569" fontSize={12} />
-                  </Funnel>
-                </FunnelChart>
-              </ResponsiveContainer>
-            </div>
-          </Card>
-        </div>
+        )}
       </main>
     </>
   );

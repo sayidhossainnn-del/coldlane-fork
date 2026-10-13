@@ -1,19 +1,34 @@
-import { Send, MailOpen, Reply, UserCheck, Plus, ArrowUpRight } from "lucide-react";
-import {
-  AreaChart,
-  Area,
-  ResponsiveContainer,
-  XAxis,
-  YAxis,
-  Tooltip,
-  CartesianGrid,
-} from "recharts";
+import { useEffect, useState } from "react";
+import { Send, Reply, UserCheck, Plus, ArrowUpRight } from "lucide-react";
 import Topbar from "../components/Topbar";
 import { Card, PrimaryButton, ProgressBar, StatCard, StatusBadge } from "../components/ui";
-import { campaigns, emailAccounts, performanceSeries, inboxThreads } from "../data/mock";
+import type { Campaign, EmailAccount, InboxThread } from "../data/mock";
+import * as api from "../lib/api";
 import { Link } from "react-router-dom";
 
 export default function Dashboard() {
+  const [stats, setStats] = useState<api.StatsResponse | null>(null);
+  const [campaigns, setCampaigns] = useState<Campaign[]>([]);
+  const [accounts, setAccounts] = useState<EmailAccount[]>([]);
+  const [replies, setReplies] = useState<InboxThread[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setLoading(true);
+    Promise.all([api.getStats(), api.listCampaigns(), api.listMailboxes(), api.listThreads("all", 4)])
+      .then(([s, c, m, t]) => {
+        setStats(s);
+        setCampaigns(c);
+        setAccounts(m);
+        setReplies(t);
+      })
+      .catch((err) => setLoadError(err instanceof Error ? err.message : "Could not load the dashboard."))
+      .finally(() => setLoading(false));
+  }, []);
+
+  const total = stats?.total;
+  const replyRate = total && total.sent ? ((total.replied / total.sent) * 100).toFixed(1) : "0.0";
   const activeCampaigns = campaigns.filter((c) => c.status === "Active");
 
   return (
@@ -28,80 +43,78 @@ export default function Dashboard() {
         }
       />
       <main className="flex-1 space-y-6 p-4 sm:p-8">
+        {loading && <p className="text-sm text-slate-400">Loading stats…</p>}
+        {loadError && (
+          <Card className="border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">{loadError}</Card>
+        )}
+
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-          <StatCard label="Emails Sent" value="18,900" delta="+12.4%" icon={Send} accent="indigo" />
-          <StatCard label="Open Rate" value="62.1%" delta="+3.1%" icon={MailOpen} accent="violet" />
-          <StatCard label="Reply Rate" value="7.7%" delta="-0.4%" positive={false} icon={Reply} accent="amber" />
-          <StatCard label="Interested Leads" value="480" delta="+18.9%" icon={UserCheck} accent="emerald" />
+          <StatCard label="Emails Sent" value={(total?.sent ?? 0).toLocaleString()} icon={Send} accent="indigo" />
+          {/* TODO(feature): open rate and week-over-week deltas — ColdLane tracks no opens and keeps no history */}
+          <StatCard label="Reply Rate" value={`${replyRate}%`} icon={Reply} accent="amber" />
+          <StatCard label="Meetings Booked" value={String(total?.meetings ?? 0)} icon={UserCheck} accent="emerald" />
         </div>
 
         <div className="grid grid-cols-1 gap-6 xl:grid-cols-3">
+          {/* TODO(feature): sent vs opens vs replies over the last 7 days — no time-series in GET /api/stats */}
           <Card className="p-5 xl:col-span-2">
             <div className="flex items-center justify-between">
               <div>
-                <h3 className="font-semibold text-slate-900">Campaign Performance</h3>
-                <p className="text-sm text-slate-500">Sent vs. opens vs. replies — last 7 days</p>
+                <h3 className="font-semibold text-slate-900">Campaigns</h3>
+                <p className="text-sm text-slate-500">Reply and bounce totals per campaign</p>
               </div>
-              <div className="flex items-center gap-4 text-xs font-medium text-slate-500">
-                <span className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-indigo-500" />Sent</span>
-                <span className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-violet-400" />Opens</span>
-                <span className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-emerald-400" />Replies</span>
-              </div>
+              <Link to="/campaigns" className="text-xs font-semibold text-indigo-600 hover:underline">
+                View all
+              </Link>
             </div>
-            <div className="mt-4 h-72">
-              <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={performanceSeries} margin={{ left: -20, right: 10 }}>
-                  <defs>
-                    <linearGradient id="sent" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#6366f1" stopOpacity={0.35} />
-                      <stop offset="95%" stopColor="#6366f1" stopOpacity={0} />
-                    </linearGradient>
-                    <linearGradient id="opens" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#a78bfa" stopOpacity={0.3} />
-                      <stop offset="95%" stopColor="#a78bfa" stopOpacity={0} />
-                    </linearGradient>
-                    <linearGradient id="replies" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#34d399" stopOpacity={0.35} />
-                      <stop offset="95%" stopColor="#34d399" stopOpacity={0} />
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid vertical={false} stroke="#f1f5f9" />
-                  <XAxis dataKey="day" tickLine={false} axisLine={false} tick={{ fill: "#94a3b8", fontSize: 12 }} />
-                  <YAxis tickLine={false} axisLine={false} tick={{ fill: "#94a3b8", fontSize: 12 }} />
-                  <Tooltip
-                    contentStyle={{ borderRadius: 12, border: "1px solid #e2e8f0", fontSize: 12 }}
-                    labelStyle={{ fontWeight: 600 }}
-                  />
-                  <Area type="monotone" dataKey="sent" stroke="#6366f1" fill="url(#sent)" strokeWidth={2} />
-                  <Area type="monotone" dataKey="opens" stroke="#a78bfa" fill="url(#opens)" strokeWidth={2} />
-                  <Area type="monotone" dataKey="replies" stroke="#34d399" fill="url(#replies)" strokeWidth={2} />
-                </AreaChart>
-              </ResponsiveContainer>
+            <div className="mt-4 divide-y divide-slate-100">
+              {(stats?.campaigns ?? []).map((c) => (
+                <Link
+                  to={`/campaigns/${c.campaign_id}`}
+                  key={c.campaign_id}
+                  className="flex items-center justify-between gap-4 py-3.5 hover:bg-slate-50 -mx-2 px-2 rounded-lg"
+                >
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-semibold text-slate-800">{c.name}</p>
+                    <p className="mt-0.5 text-xs text-slate-400">
+                      {c.sent.toLocaleString()} sent · {c.replied} replies · {c.meetings} meetings
+                    </p>
+                  </div>
+                  <StatusBadge status={api.campaignStatusLabel(c.status)} />
+                </Link>
+              ))}
+              {stats && stats.campaigns.length === 0 && (
+                <p className="py-3.5 text-sm text-slate-400">No campaigns yet.</p>
+              )}
             </div>
           </Card>
 
           <Card className="p-5">
             <div className="flex items-center justify-between">
-              <h3 className="font-semibold text-slate-900">Email Account Health</h3>
+              <h3 className="font-semibold text-slate-900">Mailbox Daily Usage</h3>
               <Link to="/accounts" className="text-xs font-semibold text-indigo-600 hover:underline">
                 Manage
               </Link>
             </div>
             <div className="mt-4 space-y-4">
-              {emailAccounts.slice(0, 4).map((acc) => (
-                <div key={acc.id}>
-                  <div className="flex items-center justify-between text-sm">
-                    <span className="truncate font-medium text-slate-700">{acc.email}</span>
-                    <span className="text-xs font-semibold text-slate-500">{acc.warmupScore}%</span>
+              {accounts.slice(0, 4).map((acc) => {
+                const cap = acc.dailyLimit || 1;
+                const used = Math.min(100, Math.round(((acc.sentToday || 0) / cap) * 100));
+                return (
+                  <div key={acc.id}>
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="truncate font-medium text-slate-700">{acc.email}</span>
+                      <span className="text-xs font-semibold text-slate-500">
+                        {acc.sentToday}/{acc.dailyLimit}
+                      </span>
+                    </div>
+                    <div className="mt-1.5">
+                      <ProgressBar value={used} color={used > 90 ? "amber" : "indigo"} />
+                    </div>
                   </div>
-                  <div className="mt-1.5">
-                    <ProgressBar
-                      value={acc.warmupScore}
-                      color={acc.warmupScore > 80 ? "emerald" : acc.warmupScore > 50 ? "indigo" : "amber"}
-                    />
-                  </div>
-                </div>
-              ))}
+                );
+              })}
+              {accounts.length === 0 && <p className="text-sm text-slate-400">No mailboxes connected yet.</p>}
             </div>
           </Card>
         </div>
@@ -131,6 +144,9 @@ export default function Dashboard() {
                   <StatusBadge status={c.status} />
                 </Link>
               ))}
+              {!loading && activeCampaigns.length === 0 && (
+                <p className="py-3.5 text-sm text-slate-400">No active campaigns.</p>
+              )}
             </div>
           </Card>
 
@@ -142,10 +158,10 @@ export default function Dashboard() {
               </Link>
             </div>
             <div className="mt-4 space-y-4">
-              {inboxThreads.slice(0, 4).map((t) => (
+              {replies.slice(0, 4).map((t) => (
                 <Link to="/inbox" key={t.id} className="flex items-start gap-3 -mx-2 rounded-lg px-2 py-1.5 hover:bg-slate-50">
                   <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-100 text-xs font-semibold text-indigo-700">
-                    {t.name.split(" ").map((n) => n[0]).join("")}
+                    {t.name.slice(0, 1).toUpperCase()}
                   </div>
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center justify-between gap-2">
@@ -156,6 +172,7 @@ export default function Dashboard() {
                   </div>
                 </Link>
               ))}
+              {replies.length === 0 && <p className="text-sm text-slate-400">No replies yet.</p>}
             </div>
           </Card>
         </div>
