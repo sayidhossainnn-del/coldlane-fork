@@ -1,6 +1,7 @@
 """Shared business rules: time, suppression, stop rules, caps, start validation, stats."""
 import datetime as dt
 import json
+import random
 import re
 
 from . import config, db
@@ -213,6 +214,109 @@ def campaign_steps(conn, campaign_id):
     return conn.execute(
         "SELECT * FROM steps WHERE campaign_id=? ORDER BY position", (campaign_id,)
     ).fetchall()
+
+
+# ---------------------------------------------------------------- step variants (A/B)
+# A step's own subject/body is arm 'A' (implicit); step_variants rows are the extra arms.
+# "variant_id IS NULL" therefore always means "the base content".
+VARIANT_LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def step_variants(conn, step_id):
+    """The extra content arms of a step, ordered by label."""
+    return conn.execute("SELECT * FROM step_variants WHERE step_id=? ORDER BY label", (step_id,)).fetchall()
+
+
+def all_variants(conn, step):
+    """Every arm of a step, base 'A' first, including disabled and already-sent arms so
+    their history stays reportable."""
+    try:
+        base_weight = step["weight"]
+    except (IndexError, KeyError):
+        base_weight = 100
+    base = {"id": None, "step_id": step["id"], "label": "A", "subject": step["subject"], "body": step["body"],
+            "weight": base_weight, "enabled": 1, "created_at": None}
+    return [base, *[dict(row) for row in step_variants(conn, step["id"])]]
+
+
+def variant_pool(conn, step):
+    """The arms a lead may be assigned to: none while the step has no enabled variants,
+    otherwise base 'A' plus every enabled row. Disabled variants are never newly assigned."""
+    rows = step_variants(conn, step["id"])
+    if not any(row["enabled"] for row in rows):
+        return []
+    return [arm for arm in all_variants(conn, step) if arm["enabled"]]
+
+
+def pick_weighted(variants, rng=None):
+    """Weighted random pick over arms carrying a `weight`. `rng` only needs .random()."""
+    rng = rng or random
+    weights = [max(0, int(v["weight"] or 0)) for v in variants]
+    total = sum(weights)
+    if total <= 0:
+        return variants[0]
+    roll = rng.random() * total
+    upto = 0.0
+    for variant, weight in zip(variants, weights):
+        upto += weight
+        if roll < upto:
+            return variant
+    return variants[-1]
+
+
+def assigned_variant(conn, lead_id, step_id):
+    """The sticky arm for this lead+step, or None when nothing has been assigned yet."""
+    return conn.execute("SELECT * FROM lead_step_variant WHERE lead_id=? AND step_id=?",
+                        (lead_id, step_id)).fetchone()
+
+
+def assign_variant(conn, lead_id, step_id, variant_id):
+    """Pin a lead to one arm for a step (variant_id None = the base content)."""
+    conn.execute("INSERT OR REPLACE INTO lead_step_variant(lead_id, step_id, variant_id) VALUES(?,?,?)",
+                 (lead_id, step_id, variant_id))
+
+
+def variant_stats(conn, campaign_id):
+    """Per step and per arm: sent, replied, bounced, unsubscribed and reply_rate.
+
+    Attribution: an event counts for the arm of the LAST send that reached that lead
+    before the event, so a reply is credited to the content the lead actually saw.
+    Stats only: nothing here disables, pauses or promotes an arm (no opens/clicks exist).
+    """
+    steps = campaign_steps(conn, campaign_id)
+    counts = {(step["id"], arm["id"]): {"sent": 0, "replied": 0, "bounced": 0, "unsubscribed": 0}
+              for step in steps for arm in all_variants(conn, step)}
+    for row in conn.execute(
+            "SELECT step_id, variant_id, COUNT(*) AS n FROM sends WHERE campaign_id=? AND status='sent' "
+            "GROUP BY step_id, variant_id", (campaign_id,)):
+        key = (row["step_id"], row["variant_id"])
+        if key in counts:
+            counts[key]["sent"] = row["n"]
+    def last_send(column):
+        """The send that reached this lead most recently before the event (e.at)."""
+        return (f"(SELECT s.{column} FROM sends s WHERE s.campaign_id=? AND s.lead_id=e.lead_id "
+                "AND s.status='sent' AND s.sent_at<=e.at ORDER BY s.sent_at DESC, s.id DESC LIMIT 1)")
+
+    for kind, field in (("reply", "replied"), ("bounce_hard", "bounced"), ("unsubscribe", "unsubscribed")):
+        for row in conn.execute(
+                f"SELECT {last_send('step_id')} AS step_id, {last_send('variant_id')} AS variant_id "
+                "FROM (SELECT lead_id, MIN(at) AS at FROM events WHERE campaign_id=? AND kind=? "
+                "AND lead_id IS NOT NULL GROUP BY lead_id) e",
+                (campaign_id, campaign_id, campaign_id, kind)):
+            key = (row["step_id"], row["variant_id"])
+            if key in counts:
+                counts[key][field] += 1
+    report = []
+    for step in steps:
+        arms = []
+        for arm in all_variants(conn, step):
+            totals = counts[(step["id"], arm["id"])]
+            arms.append({**arm, **totals,
+                         "reply_rate": round(100.0 * totals["replied"] / totals["sent"], 1)
+                         if totals["sent"] else 0.0})
+        report.append({"step_id": step["id"], "position": step["position"], "subject": step["subject"],
+                       "variants": arms})
+    return {"campaign_id": campaign_id, "steps": report}
 
 
 def validate_start(conn, campaign_id, resume=False):

@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo
 
 from flask import Blueprint, g, jsonify, make_response, request
 
-from . import config, core, crypto, db, mailer
+from . import config, core, crypto, db, engine, mailer
 
 bp = Blueprint("api", __name__, url_prefix="/api")
 
@@ -518,7 +518,8 @@ def mailbox_resume(mailbox_id):
 def _campaign_detail(conn, campaign):
     return {
         "campaign": dict(campaign),
-        "steps": [dict(row) for row in core.campaign_steps(conn, campaign["id"])],
+        "steps": [{**dict(row), "variants": _step_variants_payload(conn, row)}
+                  for row in core.campaign_steps(conn, campaign["id"])],
         "mailboxes": [_mailbox_public(conn, row) for row in core.campaign_mailboxes(conn, campaign["id"])],
         "stats": core.campaign_stats(conn, campaign["id"]),
         "start_errors": (core.validate_start(conn, campaign["id"])
@@ -674,8 +675,83 @@ def _write_campaign(conn, campaign_id, fields, mailbox_ids=None, steps=None):
         keep = {step["position"] for step in steps}
         for position, row in existing.items():
             if position not in keep and row["id"] not in sent_ids:
+                # A step that never sent can go, along with its arms and assignments
+                # (a step that was sent is kept, so its variants keep their stats).
+                conn.execute("DELETE FROM step_variants WHERE step_id=?", (row["id"],))
+                conn.execute("DELETE FROM lead_step_variant WHERE step_id=?", (row["id"],))
                 conn.execute("DELETE FROM steps WHERE id=?", (row["id"],))
     return locked
+
+
+# ---------------------------------------------------------------- step variants (A/B)
+def _step_at(conn, campaign_id, position):
+    return conn.execute("SELECT * FROM steps WHERE campaign_id=? AND position=?",
+                        (campaign_id, position)).fetchone()
+
+
+def _editable_campaign_or_error(conn, campaign_id):
+    """Variant edits follow the step-edit rule: only draft or paused campaigns."""
+    campaign = conn.execute("SELECT * FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
+    if campaign is None:
+        return None, _error("Campaign not found.", 404)
+    if campaign["status"] not in ("draft", "paused"):
+        return None, _error(f"Cannot edit a campaign with status '{campaign['status']}': only draft and paused "
+                            "campaigns are editable.", 409)
+    return campaign, None
+
+
+def _step_variants_payload(conn, step):
+    """Base arm 'A' first (NULL id, the step's own content), then the stored arms.
+
+    `locked` means the content can no longer be changed: a sent step locks 'A', and a
+    variant with sends is locked too (add a new variant instead).
+    """
+    used = {row["variant_id"] for row in conn.execute(
+        "SELECT DISTINCT variant_id FROM sends WHERE step_id=? AND variant_id IS NOT NULL", (step["id"],))}
+    step_sent = conn.execute("SELECT 1 FROM sends WHERE step_id=? AND status='sent' LIMIT 1",
+                             (step["id"],)).fetchone() is not None
+    return [{**arm, "locked": step_sent if arm["id"] is None else arm["id"] in used}
+            for arm in core.all_variants(conn, step)]
+
+
+def _weight_value(value, name):
+    try:
+        weight = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None, f"{name} must be an integer between 1 and 100."
+    if not 1 <= weight <= 100:
+        return None, f"{name} must be between 1 and 100 (got {weight})."
+    return weight, None
+
+
+def _variant_fields(data, existing=None):
+    """Validate variant content with the same rules a step's subject/body get.
+
+    A variant may have an empty subject (it then threads as "Re: <step 1 subject>"),
+    exactly like a follow-up step.
+    """
+    errors = []
+    subject = existing["subject"] if existing is not None else ""
+    body = existing["body"] if existing is not None else ""
+    if existing is None or "subject" in data:
+        subject = str(data.get("subject") or "").strip()
+    if existing is None or "body" in data:
+        body = str(data.get("body") or "").replace("\r\n", "\n").strip()
+    if not body:
+        errors.append("body is required for a variant.")
+    for text in (subject or "", body or ""):
+        if text.count("{{") != text.count("}}"):
+            errors.append("Variant content has unbalanced {{ }} merge braces.")
+    weight = existing["weight"] if existing is not None else 100
+    if data.get("weight") is not None:
+        weight, problem = _weight_value(data["weight"], "weight")
+        if problem:
+            errors.append(problem)
+            weight = existing["weight"] if existing is not None else 100
+    enabled = existing["enabled"] if existing is not None else 1
+    if data.get("enabled") is not None:
+        enabled = _as_bool(data["enabled"], enabled)
+    return {"subject": subject, "body": body, "weight": weight, "enabled": enabled}, errors
 
 
 @bp.get("/campaigns")
@@ -768,12 +844,15 @@ def campaign_delete(campaign_id):
     lead_ids = [row["id"] for row in conn.execute("SELECT id FROM leads WHERE campaign_id=?", (campaign_id,))]
     marks = ",".join("?" for _ in lead_ids) or "NULL"
     deleted = {}
+    step_filter = "step_id IN (SELECT id FROM steps WHERE campaign_id=?)"
     for table, where, args in (
             ("messages", f"campaign_id=? OR lead_id IN ({marks})", (campaign_id, *lead_ids)),
             ("events", f"campaign_id=? OR lead_id IN ({marks})", (campaign_id, *lead_ids)),
             ("sends", "campaign_id=?", (campaign_id,)),
             ("leads", "campaign_id=?", (campaign_id,)),
             ("imports", "campaign_id=?", (campaign_id,)),
+            ("step_variants", step_filter, (campaign_id,)),
+            ("lead_step_variant", step_filter, (campaign_id,)),
             ("steps", "campaign_id=?", (campaign_id,)),
             ("campaign_mailboxes", "campaign_id=?", (campaign_id,))):
         deleted[table] = conn.execute(f"DELETE FROM {table} WHERE {where}", args).rowcount
@@ -790,7 +869,8 @@ def campaign_steps_list(campaign_id):
         return _error("Campaign not found.", 404)
     sent_ids = _sent_step_ids(conn, campaign_id)
     return jsonify({"campaign_id": campaign_id, "steps": [
-        {**dict(row), "locked": row["id"] in sent_ids} for row in core.campaign_steps(conn, campaign_id)]})
+        {**dict(row), "locked": row["id"] in sent_ids, "variants": _step_variants_payload(conn, row)}
+        for row in core.campaign_steps(conn, campaign_id)]})
 
 
 @bp.get("/campaigns/<int:campaign_id>/fields")
@@ -807,6 +887,141 @@ def campaign_fields(campaign_id):
             continue
     names.discard("email")
     return jsonify({"campaign_id": campaign_id, "fields": ["email", *sorted(names)]})
+
+
+@bp.post("/campaigns/<int:campaign_id>/steps/<int:position>/variants")
+def campaign_step_variant_create(campaign_id, position):
+    """Add a content arm to a step. The step's own subject/body stays arm 'A'."""
+    conn = _conn()
+    campaign, error = _editable_campaign_or_error(conn, campaign_id)
+    if error:
+        return error
+    step = _step_at(conn, campaign_id, position)
+    if step is None:
+        return _error("Step not found in this campaign.", 404)
+    data = _payload()
+    if data is None:
+        return _error("Request body must be a JSON object.", 400)
+    fields, errors = _variant_fields(data)
+    if errors:
+        return _error("Variant validation failed.", 400, details=errors)
+    taken = {row["label"] for row in core.step_variants(conn, step["id"])}
+    label = next((letter for letter in core.VARIANT_LABELS if letter != "A" and letter not in taken), None)
+    if label is None:
+        return _error("This step already has the maximum number of variants (B-Z).", 400)
+    cur = conn.execute(
+        "INSERT INTO step_variants(step_id, label, subject, body, weight, enabled, created_at) "
+        "VALUES(?,?,?,?,?,?,?)",
+        (step["id"], label, fields["subject"], fields["body"], fields["weight"], fields["enabled"],
+         core.ts(core.utcnow())))
+    row = conn.execute("SELECT * FROM step_variants WHERE id=?", (cur.lastrowid,)).fetchone()
+    return jsonify({"step_id": step["id"], "position": position,
+                    "variant": {**dict(row), "locked": False}}), 201
+
+
+@bp.put("/variants/<int:variant_id>")
+def variant_update(variant_id):
+    """Weight and `enabled` always change; subject/body are locked once it has sends."""
+    conn = _conn()
+    variant = conn.execute("SELECT * FROM step_variants WHERE id=?", (variant_id,)).fetchone()
+    if variant is None:
+        return _error("Variant not found.", 404)
+    step = conn.execute("SELECT * FROM steps WHERE id=?", (variant["step_id"],)).fetchone()
+    if step is None:
+        return _error("Variant not found.", 404)
+    campaign, error = _editable_campaign_or_error(conn, step["campaign_id"])
+    if error:
+        return error
+    data = _payload()
+    if data is None:
+        return _error("Request body must be a JSON object.", 400)
+    sent_count = conn.execute("SELECT COUNT(*) FROM sends WHERE variant_id=?", (variant_id,)).fetchone()[0]
+    if sent_count and ("subject" in data or "body" in data):
+        return _error("This variant has already been sent, so its content is locked. "
+                      "Create a new variant instead.", 409)
+    fields, errors = _variant_fields(data, existing=variant)
+    if errors:
+        return _error("Variant validation failed.", 400, details=errors)
+    conn.execute("UPDATE step_variants SET subject=?, body=?, weight=?, enabled=? WHERE id=?",
+                 (fields["subject"], fields["body"], fields["weight"], fields["enabled"], variant_id))
+    row = conn.execute("SELECT * FROM step_variants WHERE id=?", (variant_id,)).fetchone()
+    return jsonify({"variant": {**dict(row), "locked": bool(sent_count)}})
+
+
+@bp.delete("/variants/<int:variant_id>")
+def variant_delete(variant_id):
+    """Delete an unsent variant; one that already has sends is disabled instead."""
+    conn = _conn()
+    variant = conn.execute("SELECT * FROM step_variants WHERE id=?", (variant_id,)).fetchone()
+    if variant is None:
+        return _error("Variant not found.", 404)
+    step = conn.execute("SELECT * FROM steps WHERE id=?", (variant["step_id"],)).fetchone()
+    if step is None:
+        return _error("Variant not found.", 404)
+    campaign, error = _editable_campaign_or_error(conn, step["campaign_id"])
+    if error:
+        return error
+    sent_count = conn.execute("SELECT COUNT(*) FROM sends WHERE variant_id=?", (variant_id,)).fetchone()[0]
+    if sent_count:
+        conn.execute("UPDATE step_variants SET enabled=0 WHERE id=?", (variant_id,))
+        return jsonify({"id": variant_id, "deleted": False, "disabled": True,
+                        "reason": "Already sent: disabled instead of deleted so the results stay reportable."})
+    conn.execute("DELETE FROM step_variants WHERE id=?", (variant_id,))
+    conn.execute("DELETE FROM lead_step_variant WHERE variant_id=?", (variant_id,))
+    return jsonify({"id": variant_id, "deleted": True, "disabled": False})
+
+
+@bp.put("/campaigns/<int:campaign_id>/steps/<int:position>/weights")
+def campaign_step_weights(campaign_id, position):
+    """Set several arms' weights in one call: {"weights": {"A": 50, "B": 50}}."""
+    conn = _conn()
+    campaign, error = _editable_campaign_or_error(conn, campaign_id)
+    if error:
+        return error
+    step = _step_at(conn, campaign_id, position)
+    if step is None:
+        return _error("Step not found in this campaign.", 404)
+    data = _payload()
+    if data is None:
+        return _error("Request body must be a JSON object.", 400)
+    weights = data.get("weights")
+    if not isinstance(weights, dict) or not weights:
+        return _error('weights must be an object of label -> 1-100, e.g. {"A": 50, "B": 50}.', 400)
+    rows = {row["label"]: row for row in core.step_variants(conn, step["id"])}
+    errors, parsed = [], {}
+    for raw_label, value in weights.items():
+        label = str(raw_label).strip().upper()
+        if label != "A" and label not in rows:
+            errors.append(f"Unknown variant label '{label}' for step {position}.")
+            continue
+        weight, problem = _weight_value(value, f"weights.{label}")
+        if problem:
+            errors.append(problem)
+            continue
+        parsed[label] = weight
+    if errors:
+        return _error("Weight validation failed.", 400, details=errors)
+    for label, weight in parsed.items():
+        if label == "A":
+            conn.execute("UPDATE steps SET weight=? WHERE id=?", (weight, step["id"]))
+        else:
+            conn.execute("UPDATE step_variants SET weight=? WHERE id=?", (weight, rows[label]["id"]))
+    step = conn.execute("SELECT * FROM steps WHERE id=?", (step["id"],)).fetchone()
+    return jsonify({"step_id": step["id"], "position": position,
+                    "variants": _step_variants_payload(conn, step)})
+
+
+@bp.get("/campaigns/<int:campaign_id>/variants")
+def campaign_variant_stats(campaign_id):
+    """Per step and arm: sent / replied / bounced / unsubscribed / reply_rate.
+
+    A reply is credited to the arm of the last send that reached that lead before the
+    reply. Stats only: nothing is auto-promoted, disabled or paused.
+    """
+    conn = _conn()
+    if conn.execute("SELECT 1 FROM campaigns WHERE id=?", (campaign_id,)).fetchone() is None:
+        return _error("Campaign not found.", 404)
+    return jsonify(core.variant_stats(conn, campaign_id))
 
 
 @bp.post("/campaigns/<int:campaign_id>/preview")
@@ -842,17 +1057,31 @@ def campaign_preview(campaign_id):
         # The worker sends steps[current_step] next, so preview that one (clamped to the last step).
         position = min((lead["current_step"] or 0) + 1, steps[-1]["position"])
         step = by_position[position]
+    # Arm: an explicit label wins, otherwise the lead's sticky assignment, otherwise base 'A'.
+    arms = {arm["label"]: arm for arm in core.all_variants(conn, step)}
+    if data.get("variant") is not None:
+        label = str(data["variant"]).strip().upper()
+        if label not in arms:
+            return _error("Variant not found in this step.", 404)
+    else:
+        label = "A"
+        assigned = core.assigned_variant(conn, lead["id"], step["id"])
+        if assigned is not None and assigned["variant_id"] is not None:
+            stored = conn.execute("SELECT label FROM step_variants WHERE id=?",
+                                  (assigned["variant_id"],)).fetchone()
+            if stored is not None and stored["label"] in arms:
+                label = stored["label"]
+    arm = arms[label]
     fields = json.loads(lead["fields_json"] or "{}")
     fields.setdefault("email", lead["email"])
     result = {"campaign_id": campaign_id, "lead_id": lead["id"], "email": lead["email"],
-              "position": position, "fields": fields, "merge_error": None}
+              "position": position, "variant": label, "fields": fields, "merge_error": None}
     try:
-        body = mailer.render(step["body"], fields)
-        if (step["subject"] or "").strip():
-            subject = mailer.render(step["subject"], fields)
+        body = mailer.render(arm["body"], fields)
+        if (arm["subject"] or "").strip():
+            subject = mailer.render(arm["subject"], fields)
         else:
-            base = lead["thread_subject"] or mailer.render(steps[0]["subject"], fields)
-            subject = base if base.lower().startswith("re:") else f"Re: {base}"
+            subject = engine.reply_subject(conn, lead, steps, fields)
     except mailer.MergeError as exc:
         result["merge_error"] = str(exc)
         result["subject"] = result["body"] = result["text"] = None

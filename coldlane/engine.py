@@ -78,15 +78,19 @@ def _schedule_gap(conn, mb_id, now):
                  (core.ts(now + dt.timedelta(seconds=gap)), mb_id))
 
 
-def _record_send(conn, lead, step, mb, message_id, now, status, result, attempt, subject=None, body=None):
+def _record_send(conn, lead, step, mb, message_id, now, status, result, attempt, subject=None, body=None,
+                 variant_id=None):
     """Insert the `sends` bookkeeping row. `subject`/`body` are only populated for
     emails that were actually accepted by SMTP (status='sent'); failed attempts keep
-    them NULL since nothing was actually delivered."""
+    them NULL since nothing was actually delivered. `variant_id` is NULL for the step's
+    base content (arm 'A') and the step_variants id otherwise."""
     conn.execute(
         "INSERT INTO sends(campaign_id, lead_id, step_id, step_pos, mailbox_id, recipient, recipient_domain, "
-        "message_id, sent_at, status, smtp_result, attempt, subject, body) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "message_id, sent_at, status, smtp_result, attempt, subject, body, variant_id) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (lead["campaign_id"], lead["id"], step["id"], step["position"], mb["id"], lead["email"],
-         core.domain_of(lead["email"]), message_id, core.ts(now), status, result, attempt, subject, body),
+         core.domain_of(lead["email"]), message_id, core.ts(now), status, result, attempt, subject, body,
+         variant_id),
     )
 
 
@@ -102,7 +106,47 @@ def _mailbox_failure(conn, mb, err, now):
     _schedule_gap(conn, mb["id"], now)
 
 
-def try_send_lead(conn, campaign, steps, lead_id, now):
+def resolve_variant(conn, lead, step, rng=None):
+    """The A/B content arm for this lead+step, persisted so it stays sticky.
+
+    An existing assignment always wins, even when that variant is disabled by now (it is
+    what the lead was promised). A deleted variant falls back to a fresh weighted pick.
+    Returns the variant row, or None when the base content (arm 'A') applies.
+    """
+    assigned = core.assigned_variant(conn, lead["id"], step["id"])
+    if assigned is not None:
+        if assigned["variant_id"] is None:
+            return None  # this lead is on the base content
+        variant = conn.execute("SELECT * FROM step_variants WHERE id=?", (assigned["variant_id"],)).fetchone()
+        if variant is not None:
+            return variant
+        # The arm was deleted: the lead falls back to the base content, so clear the
+        # dangling pointer before deciding again below.
+        core.assign_variant(conn, lead["id"], step["id"], None)
+    pool = core.variant_pool(conn, step)
+    if not pool:
+        return None
+    chosen = core.pick_weighted(pool, rng)
+    core.assign_variant(conn, lead["id"], step["id"], chosen["id"])
+    if chosen["id"] is None:
+        return None
+    return conn.execute("SELECT * FROM step_variants WHERE id=?", (chosen["id"],)).fetchone()
+
+
+def reply_subject(conn, lead, steps, fields):
+    """'Re: <subject the lead actually received>' for a follow-up with an empty subject.
+
+    Read from sends.subject (the first accepted send for this lead), not from the step's
+    base subject, so a variant subject threads correctly. Falls back to the lead's stored
+    thread subject and finally to rendering step 1.
+    """
+    row = conn.execute("SELECT subject FROM sends WHERE lead_id=? AND status='sent' AND subject IS NOT NULL "
+                       "AND subject != '' ORDER BY id LIMIT 1", (lead["id"],)).fetchone()
+    base = (row["subject"] if row else None) or lead["thread_subject"] or mailer.render(steps[0]["subject"], fields)
+    return base if base.lower().startswith("re:") else f"Re: {base}"
+
+
+def try_send_lead(conn, campaign, steps, lead_id, now, rng=None):
     """Attempt the next step for one lead. Returns True if an email was accepted by SMTP."""
     lead = conn.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone()
     if lead is None or lead["status"] not in ("queued", "active"):
@@ -161,13 +205,16 @@ def try_send_lead(conn, campaign, steps, lead_id, now):
 
     fields = json.loads(lead["fields_json"] or "{}")
     fields.setdefault("email", lead["email"])
+    # A/B: the arm is chosen once per lead+step and then reused on every retry.
+    variant = resolve_variant(conn, lead, step, rng)
+    variant_id = variant["id"] if variant is not None else None
     try:
-        body = mailer.render(step["body"], fields)
-        if (step["subject"] or "").strip():
-            subject = mailer.render(step["subject"], fields)
+        body = mailer.render(variant["body"] if variant is not None else step["body"], fields)
+        subject_template = (variant["subject"] if variant is not None else step["subject"]) or ""
+        if subject_template.strip():
+            subject = mailer.render(subject_template, fields)
         else:
-            base = lead["thread_subject"] or mailer.render(steps[0]["subject"], fields)
-            subject = base if base.lower().startswith("re:") else f"Re: {base}"
+            subject = reply_subject(conn, lead, steps, fields)
     except mailer.MergeError as exc:
         conn.execute("UPDATE leads SET status='merge_error', wait_reason=?, updated_at=? WHERE id=?",
                      (str(exc), core.ts(now), lead["id"]))
@@ -188,11 +235,13 @@ def try_send_lead(conn, campaign, steps, lead_id, now):
     try:
         result = mailer.send_message(mb, msg, lead["email"])
     except mailer.MailboxError as exc:
-        _record_send(conn, lead, step, mb, message_id, now, "mailbox_error", str(exc), attempt)
+        _record_send(conn, lead, step, mb, message_id, now, "mailbox_error", str(exc), attempt,
+                     variant_id=variant_id)
         _mailbox_failure(conn, mb, str(exc), now)
         return False
     except mailer.HardBounce as exc:
-        _record_send(conn, lead, step, mb, message_id, now, "bounce_hard", str(exc), attempt)
+        _record_send(conn, lead, step, mb, message_id, now, "bounce_hard", str(exc), attempt,
+                     variant_id=variant_id)
         conn.execute("UPDATE leads SET mailbox_id=? WHERE id=?", (mb["id"], lead["id"]))
         conn.execute("UPDATE mailboxes SET fail_count=0 WHERE id=?", (mb["id"],))
         _schedule_gap(conn, mb["id"], now)
@@ -201,7 +250,7 @@ def try_send_lead(conn, campaign, steps, lead_id, now):
         core.check_bounce_rate(conn, campaign["id"])
         return False
     except mailer.SoftFail as exc:
-        _record_send(conn, lead, step, mb, message_id, now, "retry", str(exc), attempt)
+        _record_send(conn, lead, step, mb, message_id, now, "retry", str(exc), attempt, variant_id=variant_id)
         _schedule_gap(conn, mb["id"], now)
         if attempt >= 3:
             conn.execute("UPDATE leads SET status='error', mailbox_id=?, attempts=?, wait_reason=?, updated_at=? WHERE id=?",
@@ -216,7 +265,8 @@ def try_send_lead(conn, campaign, steps, lead_id, now):
         return False
 
     # Success
-    _record_send(conn, lead, step, mb, message_id, now, "sent", result, attempt, subject=subject, body=body)
+    _record_send(conn, lead, step, mb, message_id, now, "sent", result, attempt, subject=subject, body=body,
+                 variant_id=variant_id)
     db.insert_message(
         conn,
         lead_id=lead["id"],
@@ -253,7 +303,7 @@ def try_send_lead(conn, campaign, steps, lead_id, now):
     return True
 
 
-def run_campaign(conn, campaign, now):
+def run_campaign(conn, campaign, now, rng=None):
     steps = core.campaign_steps(conn, campaign["id"])
     if not steps:
         return 0
@@ -266,7 +316,7 @@ def run_campaign(conn, campaign, now):
         status = conn.execute("SELECT status FROM campaigns WHERE id=?", (campaign["id"],)).fetchone()["status"]
         if status != "active":
             break
-        if try_send_lead(conn, campaign, steps, lead_id, now):
+        if try_send_lead(conn, campaign, steps, lead_id, now, rng):
             sent += 1
     remaining = conn.execute(
         "SELECT COUNT(*) FROM leads WHERE campaign_id=? AND status IN ('queued','active')", (campaign["id"],)
@@ -276,13 +326,14 @@ def run_campaign(conn, campaign, now):
     return sent
 
 
-def send_pass(conn, now=None):
+def send_pass(conn, now=None, rng=None):
+    """One send pass. `rng` is only used for the A/B weighted pick (tests inject a seeded one)."""
     now = now or core.utcnow()
     total = 0
     for campaign in conn.execute("SELECT * FROM campaigns WHERE status='active' ORDER BY id").fetchall():
         if not in_window(campaign, now):
             continue
-        total += run_campaign(conn, campaign, now)
+        total += run_campaign(conn, campaign, now, rng)
     return total
 
 

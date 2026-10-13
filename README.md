@@ -176,6 +176,7 @@ Passwords are encrypted at rest with Fernet (`ENCRYPTION_KEY`) and never shown a
 - **Bounce auto-pause:** once ≥20 emails have gone out in a campaign, a bounce rate (bounced leads ÷ emails) above `MAX_BOUNCE_RATE` pauses it with a banner.
 - **Messages:** `multipart/alternative` (your plain text plus minimal HTML generated from it, no images, links untouched), your mailbox signature, then the system footer. Follow-ups with an empty subject use `Re: <step 1 subject>` with `In-Reply-To`/`References`.
 - **Merge fields:** `{{first_name}}`, `{{company}}`, any CSV column, and fallbacks like `{{first_name|there}}`. A missing value with no fallback sets the lead to `merge_error`, so a literal `{{...}}` is never sent. **Preview** renders step 1 for the first 3 leads.
+- **A/B variants:** a step can carry extra content arms (`step_variants`, labels `B`, `C`, …) next to its own subject/body, which is arm `A` with the weight stored on the step. While a step has at least one enabled arm, each lead is assigned one arm by weighted random and pinned to it in `lead_step_variant`, so a retry never switches content and an arm disabled later is still used for the leads already on it; disabled arms are never newly assigned. Arms use the same merge renderer and validation (a merge error skips the lead like any step), and the one that went out is recorded on the send (`sends.variant_id`, NULL = arm `A`). A follow-up with an empty subject threads as `Re: <the subject that lead actually received>`, read from `sends.subject`. Results are reportable per step and arm (sent, replied, bounced, unsubscribed, reply rate — no opens or clicks): **stats only, there is no automatic winner selection**. A/B changes nothing about caps, gaps, rotation, ramp-up, suppression checks, the footer, `List-Unsubscribe` headers or threading headers.
 - **IMAP poll** every `IMAP_POLL_SECONDS`, read-only (`BODY.PEEK`, no flags, nothing deleted), from the last seen UID:
   - **Reply:** `In-Reply-To`/`References` match one of our Message-IDs, or the sender is an active lead. The lead becomes `replied` and stops in every campaign, and a 300-char snippet is stored.
   - **Auto-reply:** `Auto-Submitted`, `X-Autoreply`, `X-Autorespond` or `Precedence: auto_reply`. Logged as `auto_reply`; the sequence continues.
@@ -250,6 +251,21 @@ curl -X POST -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
   http://127.0.0.1:8080/api/campaigns/1/leads/import
 curl -X POST -H "X-API-Key: $API_KEY" -F lawful_basis_confirmed=1 -F acknowledged_by=owner \
   -F file=@leads.csv http://127.0.0.1:8080/api/campaigns/1/leads/import
+# A/B variants (draft and paused campaigns only; the step's own content is arm 'A')
+curl -X POST -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
+  -d '{"subject":"Re: {{company}} (alt)","body":"Different angle.","weight":50}' \
+  http://127.0.0.1:8080/api/campaigns/1/steps/1/variants
+curl -X PUT -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
+  -d '{"weight":70,"enabled":true}' http://127.0.0.1:8080/api/variants/3
+curl -X PUT -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
+  -d '{"weights":{"A":50,"B":50}}' http://127.0.0.1:8080/api/campaigns/1/steps/1/weights
+# disables a variant that already sent, deletes one that has not
+curl -X DELETE -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/variants/3
+# per step and arm: sent, replied, bounced, unsubscribed, reply_rate
+curl -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/campaigns/1/variants
+curl -X POST -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
+  -d '{"lead_id":7,"variant":"B"}' http://127.0.0.1:8080/api/campaigns/1/preview
+
 # Start / pause
 curl -X POST -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/campaigns/1/start
 curl -X POST -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/campaigns/1/pause
@@ -259,6 +275,8 @@ curl -H "X-API-Key: $API_KEY" 'http://127.0.0.1:8080/api/leads?campaign_id=1&sta
 # Stats (sent/replied/bounced/unsubscribed per campaign and total)
 curl -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/stats
 ```
+
+`GET /api/campaigns/{id}/steps` now lists each step's arms (`variants`, base `A` first with a `locked` flag) and `GET /api/campaigns/{id}/variants` reports sent/replied/bounced/unsubscribed/reply rate per step and arm, crediting a reply to the arm of the last send that reached that lead before the reply. `POST .../steps/{position}/variants`, `PUT|DELETE /api/variants/{id}` and `PUT .../steps/{position}/weights` only work while the campaign is a draft or paused; a variant's subject/body lock as soon as it has sends (**409**, create a new variant instead) while its weight and `enabled` stay editable, and `DELETE` disables a variant that has already sent so its results stay reportable. `POST /api/campaigns/{id}/preview` takes an optional `variant` label and otherwise previews the arm that lead is assigned to.
 
 Campaign authoring reuses the web UI's validation: mailboxes must exist, the send window must be valid, step 1 needs a subject and body, merge braces must balance, at most 5 steps, and the timezone must be a real IANA name. Import requires `lawful_basis_confirmed: true` (or the multipart field), checked **before** anything is stored, and the acknowledgement is written to the `imports` table exactly as the UI writes it (who, when, filename). Every CSV column other than `email` is kept as a merge field, emails are normalized and deduped, invalid addresses are skipped, suppressed addresses and whole suppressed domains are imported as `suppressed` (never queued), and the response reports `imported`, `duplicates`, `invalid`, `suppressed` plus the first 20 rejected rows with reasons. `PUT /api/campaigns/{id}` works only for drafts and paused campaigns and never rewrites a step that has already been sent (its position comes back in `locked_steps`); `DELETE` works only for drafts and removes that campaign's steps, mailbox links, imports and leads. `POST /api/campaigns/{id}/preview` renders one lead's next step (or an explicit `step`) with the same renderer the worker uses, reporting `merge_error` instead of raising. None of these endpoints send email — starting stays on the existing start endpoint.
 

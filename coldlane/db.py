@@ -172,6 +172,30 @@ CREATE TABLE IF NOT EXISTS templates (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+-- ------------------------------------------------------------- A/B step variants
+-- Per-step content arms. The step's own subject/body is arm 'A' implicitly (everywhere
+-- else `variant_id IS NULL` means "the base content"); rows here are the extra arms
+-- ('B', 'C', ...). `steps.weight` is A's weight. lead_step_variant pins a lead to one
+-- arm per step, so a retry never switches content.
+CREATE TABLE IF NOT EXISTS step_variants (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    step_id INTEGER NOT NULL,
+    label TEXT NOT NULL,
+    subject TEXT,
+    body TEXT,
+    weight INTEGER NOT NULL DEFAULT 100,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    UNIQUE (step_id, label)
+);
+CREATE INDEX IF NOT EXISTS idx_step_variants_step ON step_variants(step_id);
+CREATE TABLE IF NOT EXISTS lead_step_variant (
+    lead_id INTEGER NOT NULL,
+    step_id INTEGER NOT NULL,
+    variant_id INTEGER,
+    PRIMARY KEY (lead_id, step_id)
+);
 """
 
 
@@ -198,6 +222,12 @@ def _migrate(conn):
         conn.execute("ALTER TABLE sends ADD COLUMN subject TEXT")
     if "body" not in sends_cols:
         conn.execute("ALTER TABLE sends ADD COLUMN body TEXT")
+    # A/B testing: `sends.variant_id` records which arm actually went out (NULL = the
+    # step's base content, i.e. arm 'A') and `steps.weight` is arm 'A''s weight.
+    if "variant_id" not in sends_cols:
+        conn.execute("ALTER TABLE sends ADD COLUMN variant_id INTEGER")
+    if "weight" not in _column_names(conn, "steps"):
+        conn.execute("ALTER TABLE steps ADD COLUMN weight INTEGER NOT NULL DEFAULT 100")
 
 
 def init_db(path=None):
