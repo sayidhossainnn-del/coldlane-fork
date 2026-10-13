@@ -1,8 +1,9 @@
-import { useState } from "react";
-import { Card, Badge, Button, Progress, Avatar, Icon, Tabs, Toggle, Field, inputCls, SectionTitle, Ring } from "../components/ui";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Card, Badge, Button, Progress, Avatar, Icon, Tabs, Field, inputCls, SectionTitle, Ring } from "../components/ui";
 import { AreaChart, Donut } from "../components/Charts";
-import { campaigns, leads as allLeads, rangeSeries, firstNameVars } from "../lib/data";
-import type { SequenceStep, StepType } from "../lib/data";
+import * as api from "../lib/api";
+import type { RawCampaignDetail, RawPreview, RawVariantStats } from "../lib/api";
+import type { Campaign, Lead, SequenceStep, StepType } from "../lib/data";
 import { CampaignCard } from "./Campaigns";
 
 const stepMeta: Record<StepType, { icon: string; color: string; label: string }> = {
@@ -13,19 +14,12 @@ const stepMeta: Record<StepType, { icon: string; color: string; label: string }>
   condition: { icon: "branch", color: "text-violet-300 bg-violet-500/12 ring-violet-500/25", label: "Condition" },
 };
 
-const STEP_LIB: StepType[] = ["email", "call", "linkedin", "wait", "condition"];
+// The API only stores email steps (max 5), so that is the only addable step type.
+const STEP_LIB: StepType[] = ["email"];
 
-const relatedLeads = allLeads.slice(0, 7);
-
-function renderPreview(body: string, leadName = "Sarah") {
-  return body
-    .replace(/\{\{first_name\}\}/g, leadName)
-    .replace(/\{\{last_name\}\}/g, "Whitmore")
-    .replace(/\{\{company\}\}/g, "Lumenstack")
-    .replace(/\{\{title\}\}/g, "VP Engineering")
-    .replace(/\{\{location\}\}/g, "Austin, TX")
-    .split("\n")
-    .map((line, i) => <p key={i} className="min-h-[1em] leading-relaxed">{line || "\u00A0"}</p>);
+function renderLines(text: string) {
+  // No sample lead exists: merge tags render exactly as stored.
+  return text.split("\n").map((line, i) => <p key={i} className="min-h-[1em] leading-relaxed">{line || "\u00A0"}</p>);
 }
 
 function StepNode({
@@ -33,27 +27,37 @@ function StepNode({
   index,
   selected,
   onSelect,
-  onToggle,
   onMove,
   onDelete,
+  onDropOn,
+  editable,
 }: {
   step: SequenceStep;
   index: number;
   selected: boolean;
   onSelect: () => void;
-  onToggle: () => void;
   onMove: (dir: -1 | 1) => void;
   onDelete: () => void;
+  onDropOn: (draggedId: string) => void;
+  editable: boolean;
 }) {
   const meta = stepMeta[step.type];
   return (
-    <div className="relative">
+    <div
+      className="relative"
+      onDragOver={(e) => e.preventDefault()}
+      onDrop={(e) => {
+        e.stopPropagation();
+        const sid = e.dataTransfer.getData("text/plain");
+        if (sid) onDropOn(sid);
+      }}
+    >
       {/* connector */}
       {index > 0 && (
         <div className="absolute left-[26px] top-[-18px] h-[18px] w-px bg-gradient-to-b from-transparent to-ink-600" />
       )}
       <div
-        draggable
+        draggable={editable}
         onDragStart={(e) => e.dataTransfer.setData("text/plain", step.id)}
         onClick={onSelect}
         className={`group flex cursor-pointer items-start gap-3 rounded-xl border p-3 transition-all ${
@@ -73,7 +77,7 @@ function StepNode({
               {step.type === "wait" ? `after ${step.waitDays ?? 1}d` : `day ${step.dayOffset}`}
             </span>
             {step.variants && step.variants.length > 1 && <Badge tone="violet">{step.variants.length} variants</Badge>}
-            {!step.enabled && <Badge tone="slate">off</Badge>}
+            {/* The API has no per-step enable flag: the "off" badge never appears. */}
           </div>
           <p className="mt-1 truncate text-[13px] font-medium text-white">{step.title}</p>
           {step.subject && <p className="mt-0.5 truncate text-[11.5px] text-slate-500">Subject: {step.subject}</p>}
@@ -82,37 +86,178 @@ function StepNode({
           {step.stats && (
             <div className="mt-2.5 flex items-center gap-4 text-[11px]">
               <span className="text-slate-500">Sent <b className="text-slate-300">{step.stats.sent.toLocaleString()}</b></span>
-              <span className="text-slate-500">Open <b className="text-sky-300">{((step.stats.opened / step.stats.sent) * 100).toFixed(0)}%</b></span>
+              {/* No open tracking exists in the API: the "Open" stat is hidden. */}
               <span className="text-slate-500">Reply <b className="text-emerald-300">{((step.stats.replied / step.stats.sent) * 100).toFixed(1)}%</b></span>
             </div>
           )}
         </div>
 
-        <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition group-hover:opacity-100">
-          <button onClick={(e) => { e.stopPropagation(); onMove(-1); }} className="rounded p-1 text-slate-500 hover:bg-white/10 hover:text-white"><Icon name="chevronDown" className="h-3.5 w-3.5 rotate-180" /></button>
-          <button onClick={(e) => { e.stopPropagation(); onMove(1); }} className="rounded p-1 text-slate-500 hover:bg-white/10 hover:text-white"><Icon name="chevronDown" className="h-3.5 w-3.5" /></button>
-          <button onClick={(e) => { e.stopPropagation(); onDelete(); }} className="rounded p-1 text-slate-500 hover:bg-rose-500/20 hover:text-rose-300"><Icon name="trash" className="h-3.5 w-3.5" /></button>
-          <div onClick={(e) => { e.stopPropagation(); onToggle(); }} className="pl-1">
-            <Toggle on={step.enabled} />
+        {editable && (
+          <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition group-hover:opacity-100">
+            <button onClick={(e) => { e.stopPropagation(); onMove(-1); }} className="rounded p-1 text-slate-500 hover:bg-white/10 hover:text-white"><Icon name="chevronDown" className="h-3.5 w-3.5 rotate-180" /></button>
+            <button onClick={(e) => { e.stopPropagation(); onMove(1); }} className="rounded p-1 text-slate-500 hover:bg-white/10 hover:text-white"><Icon name="chevronDown" className="h-3.5 w-3.5" /></button>
+            <button onClick={(e) => { e.stopPropagation(); onDelete(); }} className="rounded p-1 text-slate-500 hover:bg-rose-500/20 hover:text-rose-300"><Icon name="trash" className="h-3.5 w-3.5" /></button>
+            {/* Step-level toggle: no API flag — hidden (variant arms keep their own enabled flag). */}
           </div>
-        </div>
+        )}
       </div>
     </div>
   );
 }
 
 export function CampaignDetail({ id, onBack, toast }: { id: string; onBack: () => void; toast: (m: string, t?: string) => void }) {
-  const campaign = campaigns.find((c) => c.id === id) ?? campaigns[0];
+  const [detail, setDetail] = useState<RawCampaignDetail | null>(null);
+  const [variantStats, setVariantStats] = useState<RawVariantStats | null>(null);
+  const [fields, setFields] = useState<string[]>(["email"]);
+  const [leads, setLeads] = useState<Lead[]>([]);
+  const [leadsTotal, setLeadsTotal] = useState(0);
+  const [leadsLoading, setLeadsLoading] = useState(true);
+  const [leadsError, setLeadsError] = useState<string | null>(null);
+  const [leadsKey, setLeadsKey] = useState(0);
+  const [others, setOthers] = useState<Campaign[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [steps, setSteps] = useState<SequenceStep[]>([]);
+  const [delays, setDelays] = useState<Record<string, number>>({});
+  const [dirty, setDirty] = useState<string[]>([]);
+  const [selectedId, setSelectedId] = useState("");
   const [tab, setTab] = useState("Sequence");
-  const [steps, setSteps] = useState<SequenceStep[]>(campaign.sequence);
-  const [selectedId, setSelectedId] = useState(campaign.sequence[0]?.id ?? "");
   const [device, setDevice] = useState<"desktop" | "mobile">("desktop");
   const [variantIdx, setVariantIdx] = useState(0);
   const [dragOver, setDragOver] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [acting, setActing] = useState(false);
+  const [nameDraft, setNameDraft] = useState("");
+  const [daysDraft, setDaysDraft] = useState<number[]>([]);
+  const [startDraft, setStartDraft] = useState(9);
+  const [endDraft, setEndDraft] = useState(17);
+  const [preview, setPreview] = useState<RawPreview | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [query, setQuery] = useState("");
+  const [importOpen, setImportOpen] = useState(false);
+  const [importFile, setImportFile] = useState<{ name: string; text: string } | null>(null);
+  const [lawful, setLawful] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const pendingVariant = useRef<{ stepId: string; variantId: string } | null>(null);
 
+  const load = useCallback(() => {
+    setLoading(true);
+    setLoadError(null);
+    return Promise.all([api.getCampaign(id), api.getCampaignVariants(id), api.getCampaignFields(id)])
+      .then(([d, vs, f]) => {
+        setDetail(d);
+        setVariantStats(vs);
+        setFields(f.fields);
+        const replied: Record<number, number> = {};
+        vs.steps.forEach((s) => {
+          replied[s.position] = s.variants.reduce((a, v) => a + (v.replied ?? 0), 0);
+        });
+        const stepStats: Record<number, { sent: number; replied: number }> = {};
+        d.steps.forEach((s) => {
+          stepStats[s.position] = {
+            sent: d.stats.per_step?.[String(s.position)] ?? 0,
+            replied: replied[s.position] ?? 0,
+          };
+        });
+        const seq = api.toSequence(d.steps, stepStats);
+        setSteps(seq);
+        setDelays(Object.fromEntries(d.steps.map((s) => [String(s.id), s.delay_minutes ?? 0])));
+        setDirty([]);
+        setSelectedId((cur) => (seq.some((s) => s.id === cur) ? cur : (seq[0]?.id ?? "")));
+        setNameDraft(d.campaign.name);
+        const days = (d.campaign.window_days ?? "").split(",").map((x) => Number(x.trim())).filter((x) => Number.isInteger(x) && x >= 0 && x <= 6);
+        setDaysDraft(days);
+        setStartDraft(d.campaign.window_start_hour);
+        setEndDraft(d.campaign.window_end_hour);
+        const pending = pendingVariant.current;
+        if (pending) {
+          pendingVariant.current = null;
+          const target = seq.find((s) => s.id === pending.stepId);
+          const idx = target?.variants?.findIndex((v) => v.id === pending.variantId) ?? -1;
+          if (idx >= 0) {
+            setSelectedId(pending.stepId);
+            setVariantIdx(idx);
+          }
+        }
+      })
+      .catch((err) => setLoadError(api.errorMessage(err)))
+      .finally(() => setLoading(false));
+  }, [id]);
+
+  useEffect(() => {
+    load();
+    api.listCampaigns().then((rows) => setOthers(rows.filter((c) => c.id !== id).slice(0, 3))).catch(() => setOthers([]));
+  }, [load, id]);
+
+  useEffect(() => {
+    setLeadsLoading(true);
+    setLeadsError(null);
+    api
+      .listLeads({ campaign_id: id, limit: 500 })
+      .then((r) => {
+        setLeads(r.leads.map(api.toLead));
+        setLeadsTotal(r.total);
+      })
+      .catch((err) => setLeadsError(api.errorMessage(err)))
+      .finally(() => setLeadsLoading(false));
+  }, [id, leadsKey]);
+
+  const previewLead = leads[0];
+  const selectedPos = detail ? detail.steps.findIndex((s) => String(s.id) === selectedId) + 1 : 0;
+  useEffect(() => {
+    if (!detail || !previewLead || selectedPos < 1) {
+      setPreview(null);
+      return;
+    }
+    const rawStep = detail.steps[selectedPos - 1];
+    const arms = rawStep.variants ?? [];
+    const arm = arms[Math.min(variantIdx, Math.max(0, arms.length - 1))];
+    const letter = arm && arm.id !== null ? arm.label : undefined;
+    setPreviewLoading(true);
+    api
+      .previewCampaign(id, previewLead.id, { step: selectedPos, ...(letter ? { variant: letter } : {}) })
+      .then(setPreview)
+      .catch(() => setPreview(null))
+      .finally(() => setPreviewLoading(false));
+  }, [id, detail, previewLead, selectedPos, variantIdx]);
+
+  const detailCampaign = detail
+    ? {
+        ...api.toCampaign({ ...detail.campaign, stats: detail.stats }),
+        dailyLimit: detail.mailboxes.reduce((a, m) => a + (m.daily_cap ?? 0), 0),
+      }
+    : null;
+
+  const editable = !!detail && (detail.campaign.status === "draft" || detail.campaign.status === "paused");
   const selected = steps.find((s) => s.id === selectedId) ?? steps[0];
+  const fallbackArm = selected ? { id: `local-${selected.id}`, label: "Variant A", subject: selected.subject ?? "", body: selected.body ?? "", share: 100 } : null;
+  const arms = selected?.variants ?? (fallbackArm ? [fallbackArm] : []);
+  const armIdx = Math.min(variantIdx, Math.max(0, arms.length - 1));
+  const arm = arms[armIdx];
+  const armIsStored = !!arm && /^\d+$/.test(arm.id);
+  const armIsA = !armIsStored; // arm 'A' (or an unsaved local step) edits the step's own content
+  const subjectValue = armIsA ? (selected?.subject ?? "") : (arm?.subject ?? "");
+  const bodyValue = armIsA ? (selected?.body ?? "") : (arm?.body ?? "");
 
-  const patch = (p: Partial<SequenceStep>) => setSteps((prev) => prev.map((s) => (s.id === selected.id ? { ...s, ...p } : s)));
+  const patch = (p: Partial<SequenceStep>) => {
+    if (!selected) return;
+    setSteps((prev) => prev.map((s) => (s.id === selected.id ? { ...s, ...p } : s)));
+  };
+
+  const patchArm = (idx: number, p: { subject?: string; body?: string }) => {
+    if (!selected) return;
+    const target = (selected.variants ?? [])[idx];
+    if (!target) return;
+    setSteps((prev) =>
+      prev.map((s) =>
+        s.id === selected.id
+          ? { ...s, variants: (s.variants ?? []).map((v, i) => (i === idx ? { ...v, ...p } : v)) }
+          : s,
+      ),
+    );
+    if (/^\d+$/.test(target.id)) setDirty((d) => (d.includes(target.id) ? d : [...d, target.id]));
+  };
 
   const addStep = (type: StepType) => {
     const meta = stepMeta[type];
@@ -127,21 +272,253 @@ export function CampaignDetail({ id, onBack, toast }: { id: string; onBack: () =
       enabled: true,
     };
     setSteps((p) => [...p, s]);
+    setDelays((d) => ({ ...d, [s.id]: 0 }));
     setSelectedId(s.id);
-    toast(`${meta.label} step added`, "brand");
+    setVariantIdx(0);
+    toast(`${meta.label} step added — save to apply`, "brand");
   };
 
   const move = (sid: string, dir: -1 | 1) =>
     setSteps((prev) => {
       const i = prev.findIndex((s) => s.id === sid);
       const j = i + dir;
-      if (j < 0 || j >= prev.length) return prev;
+      if (i < 0 || j < 0 || j >= prev.length) return prev;
       const next = [...prev];
       [next[i], next[j]] = [next[j], next[i]];
       return next;
     });
 
-  const p = (n: number, d: number) => (d ? ((n / d) * 100).toFixed(1) : "0.0");
+  const reorderTo = (draggedId: string, targetId: string) => {
+    if (draggedId === targetId) return;
+    setSteps((prev) => {
+      const from = prev.findIndex((s) => s.id === draggedId);
+      const to = prev.findIndex((s) => s.id === targetId);
+      if (from < 0 || to < 0) return prev;
+      const next = [...prev];
+      const [item] = next.splice(from, 1);
+      next.splice(to, 0, item);
+      return next;
+    });
+    toast("Step moved — save to apply", "brand");
+  };
+
+  const removeStep = (sid: string) => {
+    setSteps((prev) => prev.filter((x) => x.id !== sid));
+    toast("Step removed — save to apply", "rose");
+  };
+
+  const duplicateStep = () => {
+    if (!selected) return;
+    const copy: SequenceStep = { ...selected, id: `s_${Math.random().toString(36).slice(2, 7)}`, subject: selected.subject, body: selected.body };
+    setSteps((prev) => {
+      const i = prev.findIndex((s) => s.id === selected.id);
+      const next = [...prev];
+      next.splice(i + 1, 0, copy);
+      return next;
+    });
+    setDelays((d) => ({ ...d, [copy.id]: delays[selected.id] ?? 0 }));
+    toast("Step duplicated — save to apply", "brand");
+  };
+
+  const addVariant = () => {
+    if (!selected || selectedPos < 1 || saving) return;
+    setSaving(true);
+    api
+      .createVariant(id, selectedPos, { subject: selected.subject ?? "", body: selected.body ?? "" })
+      .then((res) => {
+        pendingVariant.current = { stepId: selected.id, variantId: String(res.variant.id) };
+        toast(`Variant ${res.variant.label} added`, "emerald");
+        return load();
+      })
+      .catch((err) => toast(api.errorMessage(err), "rose"))
+      .finally(() => setSaving(false));
+  };
+
+  const save = () => {
+    if (saving || !detail || !editable) return;
+    setSaving(true);
+    const payload = steps.map((s) => ({
+      subject: s.subject ?? "",
+      body: s.body ?? "",
+      delay_minutes: delays[s.id] ?? 0,
+    }));
+    const armsToSave = steps.flatMap((s) =>
+      (s.variants ?? []).filter((v) => dirty.includes(v.id)).map((v) => ({ id: v.id, subject: v.subject, body: v.body })),
+    );
+    const jobs: Promise<unknown>[] = [api.updateCampaign(id, { steps: payload })];
+    armsToSave.forEach((a) => jobs.push(api.updateVariant(a.id, { subject: a.subject, body: a.body })));
+    Promise.allSettled(jobs)
+      .then((results) => {
+        const failed = results.filter((r) => r.status === "rejected") as PromiseRejectedResult[];
+        if (failed.length) {
+          toast(api.errorMessage(failed[0].reason), "rose");
+        } else {
+          const put = results[0] as PromiseFulfilledResult<RawCampaignDetail & { locked_steps?: number[] }>;
+          const locked = put.value.locked_steps ?? [];
+          toast(
+            locked.length
+              ? `Sequence saved · step${locked.length > 1 ? "s" : ""} ${locked.join(", ")} already sent and stayed locked`
+              : "Sequence saved",
+            locked.length ? "amber" : "emerald",
+          );
+        }
+        setDirty([]);
+        load();
+      })
+      .finally(() => setSaving(false));
+  };
+
+  const pause = () => {
+    if (acting) return;
+    setActing(true);
+    api
+      .pauseCampaign(id)
+      .then(() => {
+        toast("Campaign paused", "amber");
+        load();
+      })
+      .catch((err) => toast(api.errorMessage(err), "rose"))
+      .finally(() => setActing(false));
+  };
+
+  const resume = () => {
+    if (acting) return;
+    setActing(true);
+    api
+      .startCampaign(id)
+      .then(() => {
+        toast("Campaign started — sending now", "emerald");
+        load();
+      })
+      .catch((err) => toast(api.errorMessage(err), "rose"))
+      .finally(() => setActing(false));
+  };
+
+  const saveSchedule = () => {
+    if (saving || !editable) return;
+    if (!daysDraft.length) {
+      toast("Pick at least one send day.", "rose");
+      return;
+    }
+    setSaving(true);
+    api
+      .updateCampaign(id, { days: daysDraft, window_start: startDraft, window_end: endDraft })
+      .then(() => {
+        toast("Schedule updated", "emerald");
+        load();
+      })
+      .catch((err) => toast(api.errorMessage(err), "rose"))
+      .finally(() => setSaving(false));
+  };
+
+  const saveSettings = () => {
+    if (saving || !editable) return;
+    if (!nameDraft.trim()) {
+      toast("Campaign name is required.", "rose");
+      return;
+    }
+    setSaving(true);
+    api
+      .updateCampaign(id, { name: nameDraft.trim() })
+      .then(() => {
+        toast("Settings saved", "emerald");
+        load();
+      })
+      .catch((err) => toast(api.errorMessage(err), "rose"))
+      .finally(() => setSaving(false));
+  };
+
+  const archive = () => {
+    if (acting) return;
+    setActing(true);
+    api
+      .deleteCampaign(id)
+      .then(() => {
+        toast("Campaign deleted", "rose");
+        onBack();
+      })
+      .catch((err) => toast(api.errorMessage(err), "rose"))
+      .finally(() => setActing(false));
+  };
+
+  const readCsv = (file: File | undefined) => {
+    if (!file) return;
+    file
+      .text()
+      .then((text) => setImportFile({ name: file.name, text }))
+      .catch(() => toast("Could not read that file.", "rose"));
+  };
+
+  const startImport = () => {
+    if (importing) return;
+    if (!importFile) {
+      toast("Choose a CSV file first.", "rose");
+      return;
+    }
+    if (!lawful) {
+      toast("Confirm you have a lawful basis to email these contacts.", "rose");
+      return;
+    }
+    setImporting(true);
+    api
+      .importLeads(id, { csv_text: importFile.text, filename: importFile.name, lawful_basis_confirmed: true })
+      .then((res) => {
+        const c = res.counts;
+        setImportOpen(false);
+        setImportFile(null);
+        setLawful(false);
+        toast(`${c.imported} imported · ${c.duplicates} duplicates · ${c.invalid} invalid · ${c.suppressed} suppressed`, "emerald");
+        setLeadsKey((k) => k + 1);
+        load();
+      })
+      .catch((err) => toast(api.errorMessage(err), "rose"))
+      .finally(() => setImporting(false));
+  };
+
+  const stats = detail?.stats;
+  const delivered = stats && stats.gone_out > 0 ? Math.max(0, ((stats.gone_out - stats.bounced) / stats.gone_out) * 100) : 0;
+  const avgDelayDays = steps.length > 1
+    ? steps.slice(1).reduce((a, s) => a + (delays[s.id] ?? 0), 0) / (steps.length - 1) / 1440
+    : 0;
+  const stepChart = steps.map((s, i) => ({ label: String(i + 1), sent: s.stats?.sent ?? 0, opened: 0, replied: s.stats?.replied ?? 0 }));
+  const stepChartTotal = stepChart.reduce((a, d) => a + d.sent, 0);
+  const variantRows = (variantStats?.steps ?? []).flatMap((s) =>
+    s.variants.length > 1
+      ? s.variants.map((v) => ({ key: `${s.position}-${v.label}`, label: `Variant ${v.label} · step ${s.position}`, rate: v.reply_rate }))
+      : [],
+  );
+  const shownLeads = leads.filter((l) => (l.name + l.email + l.company).toLowerCase().includes(query.toLowerCase()));
+  const splitLabel = arms.length > 1 && arm ? (() => {
+    const total = arms.reduce((a, v) => a + (v.share || 0), 0) || 1;
+    return `${arms.map((v) => Math.round(((v.share || 0) / total) * 100)).join(" / ")} split`;
+  })() : null;
+  const senderBox = detail?.mailboxes[0] ?? null;
+
+  if (loading) {
+    return (
+      <div className="space-y-5">
+        <Card className="grid place-items-center py-16">
+          <p className="text-[12px] text-slate-500">Loading campaign…</p>
+        </Card>
+      </div>
+    );
+  }
+  if (loadError || !detail || !detailCampaign || !stats) {
+    return (
+      <div className="space-y-5">
+        <Card className="grid place-items-center py-16 text-center">
+          <p className="text-[12px] text-slate-400">{loadError ?? "Campaign not found."}</p>
+          <button onClick={() => (loadError ? load() : onBack())} className="mt-2 text-[12px] text-brand-300 hover:text-brand-200">
+            {loadError ? "Retry" : "Back to campaigns"}
+          </button>
+        </Card>
+      </div>
+    );
+  }
+
+  const campaign = detailCampaign;
+  const schedule = api.scheduleLabel(detail.campaign, true);
+  const daysShort = api.daysLabel(detail.campaign.window_days);
 
   return (
     <div className="space-y-5">
@@ -160,28 +537,32 @@ export function CampaignDetail({ id, onBack, toast }: { id: string; onBack: () =
               </div>
               <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11.5px] text-slate-500">
                 <span className="flex items-center gap-1.5"><Icon name="users" className="h-3.5 w-3.5" />{campaign.leads.toLocaleString()} leads</span>
-                <span className="flex items-center gap-1.5"><Icon name="at" className="h-3.5 w-3.5" />{campaign.accounts.length} sending accounts</span>
-                <span className="flex items-center gap-1.5"><Icon name="clock" className="h-3.5 w-3.5" />Mon–Fri · 9:00–17:00 (CST)</span>
-                <span className="flex items-center gap-1.5"><Icon name="zap" className="h-3.5 w-3.5" />{campaign.dailyLimit}/day cap</span>
+                <span className="flex items-center gap-1.5"><Icon name="at" className="h-3.5 w-3.5" />{detail.mailboxes.length} sending accounts</span>
+                <span className="flex items-center gap-1.5"><Icon name="clock" className="h-3.5 w-3.5" />{schedule}</span>
+                {campaign.dailyLimit > 0 && (
+                  <span className="flex items-center gap-1.5"><Icon name="zap" className="h-3.5 w-3.5" />{campaign.dailyLimit}/day cap</span>
+                )}
               </div>
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <Button variant="default" icon="copy" onClick={() => toast("Campaign duplicated as draft", "brand")}>Duplicate</Button>
-            <Button variant="default" icon="pause">Pause</Button>
-            <Button variant="primary" icon="play" onClick={() => toast("Campaign resumed — sending now", "emerald")}>Resume</Button>
+            {/* "Duplicate": no API — hidden. */}
+            {campaign.status === "active" ? (
+              <Button variant="default" icon="pause" disabled={acting} onClick={pause}>{acting ? "Pausing…" : "Pause"}</Button>
+            ) : (
+              <Button variant="primary" icon="play" disabled={acting} onClick={resume}>{acting ? "Starting…" : "Resume"}</Button>
+            )}
           </div>
         </div>
 
         <div className="mt-5 grid gap-3 border-t border-ink-700/60 pt-4 sm:grid-cols-3 lg:grid-cols-6">
-          {[
-            ["Delivered", `${p(campaign.sent - campaign.bounced, campaign.sent)}%`, "text-white"],
-            ["Open rate", `${p(campaign.opened, campaign.sent)}%`, "text-sky-300"],
-            ["Reply rate", `${p(campaign.replied, campaign.sent)}%`, "text-emerald-300"],
-            ["Positive", `${p(campaign.positive, campaign.replied)}%`, "text-emerald-300"],
-            ["Bounce", `${p(campaign.bounced, campaign.sent)}%`, "text-rose-300"],
-            ["Meetings", campaign.meetings.toString(), "text-violet-300"],
-          ].map(([l, v, c]) => (
+          {([
+            ["Delivered", `${delivered.toFixed(1)}%`, "text-white"],
+            // "Open rate" and "Positive": no open tracking / positive-reply aggregate — hidden.
+            ["Reply rate", `${stats.reply_rate}%`, "text-emerald-300"],
+            ["Bounce", `${stats.bounce_rate}%`, "text-rose-300"],
+            ["Meetings", stats.meetings.toString(), "text-violet-300"],
+          ] as [string, string, string][]).map(([l, v, c]) => (
             <div key={l}>
               <p className="text-[10px] uppercase tracking-wider text-slate-500">{l}</p>
               <p className={`mt-0.5 text-[17px] font-semibold tabular-nums ${c}`}>{v}</p>
@@ -200,70 +581,77 @@ export function CampaignDetail({ id, onBack, toast }: { id: string; onBack: () =
               <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
                 <div>
                   <h3 className="text-[15px] font-semibold tracking-tight text-white">Sequence builder</h3>
-                  <p className="mt-0.5 text-xs text-slate-500">{steps.length} steps · drag to reorder · avg. delay 3.2 days</p>
+                  <p className="mt-0.5 text-xs text-slate-500">
+                    {steps.length} steps · drag to reorder · avg. delay {avgDelayDays % 1 === 0 ? avgDelayDays : avgDelayDays.toFixed(1)} days
+                  </p>
                 </div>
                 <div className="flex items-center gap-2">
                   <Badge tone="emerald" dot>Auto-ongoing</Badge>
-                  <Button size="sm" variant="default" icon="sparkles" onClick={() => toast("AI drafted a new follow-up", "violet")}>AI step</Button>
+                  {/* "AI step": no step-drafting endpoint — hidden. */}
                 </div>
               </div>
 
               <div
                 onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
                 onDragLeave={() => setDragOver(false)}
-                onDrop={(e) => {
-                  e.preventDefault();
-                  setDragOver(false);
-                  const sid = e.dataTransfer.getData("text/plain");
-                  if (sid) toast("Step reordered", "brand");
-                }}
+                onDrop={(e) => { e.preventDefault(); setDragOver(false); }}
                 className={`space-y-3 rounded-xl p-1 transition ${dragOver ? "ring-2 ring-brand-500/40" : ""}`}
               >
+                {steps.length === 0 && (
+                  <p className="rounded-xl border border-dashed border-ink-700 px-4 py-8 text-center text-[12.5px] text-slate-500">
+                    No steps yet. Add an email step below.
+                  </p>
+                )}
                 {steps.map((s, i) => (
                   <StepNode
                     key={s.id}
                     step={s}
                     index={i}
+                    editable={editable}
                     selected={selected?.id === s.id}
-                    onSelect={() => setSelectedId(s.id)}
-                    onToggle={() => setSteps((prev) => prev.map((x) => (x.id === s.id ? { ...x, enabled: !x.enabled } : x)))}
+                    onSelect={() => { setSelectedId(s.id); setVariantIdx(0); }}
                     onMove={(d) => move(s.id, d)}
-                    onDelete={() => {
-                      setSteps((prev) => prev.filter((x) => x.id !== s.id));
-                      toast("Step removed", "rose");
-                    }}
+                    onDelete={() => removeStep(s.id)}
+                    onDropOn={(draggedId) => reorderTo(draggedId, s.id)}
                   />
                 ))}
               </div>
 
-              <div className="mt-4 border-t border-dashed border-ink-700 pt-4">
-                <p className="mb-2.5 text-[10px] font-semibold uppercase tracking-widest text-slate-600">Add step</p>
-                <div className="flex flex-wrap gap-2">
-                  {STEP_LIB.map((t) => (
-                    <button
-                      key={t}
-                      onClick={() => addStep(t)}
-                      className={`flex items-center gap-2 rounded-lg border border-ink-700 bg-ink-850/70 px-3 py-2 text-[12px] text-slate-300 transition hover:-translate-y-0.5 hover:border-brand-500/50 hover:bg-brand-500/10 hover:text-white`}
-                    >
-                      <Icon name={stepMeta[t].icon} className="h-3.5 w-3.5" />
-                      {stepMeta[t].label}
-                      <Icon name="plus" className="h-3 w-3 opacity-50" />
-                    </button>
-                  ))}
+              {editable && (
+                <div className="mt-4 border-t border-dashed border-ink-700 pt-4">
+                  <p className="mb-2.5 text-[10px] font-semibold uppercase tracking-widest text-slate-600">Add step</p>
+                  <div className="flex flex-wrap gap-2">
+                    {STEP_LIB.map((t) => (
+                      <button
+                        key={t}
+                        onClick={() => addStep(t)}
+                        className={`flex items-center gap-2 rounded-lg border border-ink-700 bg-ink-850/70 px-3 py-2 text-[12px] text-slate-300 transition hover:-translate-y-0.5 hover:border-brand-500/50 hover:bg-brand-500/10 hover:text-white`}
+                      >
+                        <Icon name={stepMeta[t].icon} className="h-3.5 w-3.5" />
+                        {stepMeta[t].label}
+                        <Icon name="plus" className="h-3 w-3 opacity-50" />
+                      </button>
+                    ))}
+                    {/* Call / LinkedIn / Wait / Condition steps have no API: hidden. */}
+                  </div>
                 </div>
-              </div>
+              )}
             </Card>
 
             <Card>
-              <SectionTitle title="Step comparison" sub="Reply rate per step in this sequence" />
-              <AreaChart
-                data={rangeSeries["7d"]}
-                height={150}
-                series={[
-                  { key: "replied", color: "#34d399", name: "Replies" },
-                  { key: "opened", color: "#22d3ee", name: "Opens" },
-                ]}
-              />
+              <SectionTitle title="Step comparison" sub="Sends vs. replies per step" />
+              {stepChartTotal > 0 ? (
+                <AreaChart
+                  data={stepChart}
+                  height={150}
+                  series={[
+                    { key: "sent", color: "#6366f1", name: "Sent" },
+                    { key: "replied", color: "#34d399", name: "Replies" },
+                  ]}
+                />
+              ) : (
+                <p className="py-8 text-center text-[12px] text-slate-500">No sends yet in this sequence.</p>
+              )}
             </Card>
           </div>
 
@@ -308,7 +696,12 @@ export function CampaignDetail({ id, onBack, toast }: { id: string; onBack: () =
                 ) : (
                   <div className="space-y-3.5 p-4">
                     <Field label={selected.type === "email" ? "Subject line" : "Task title"}>
-                      <input className={inputCls} value={selected.subject ?? selected.title} onChange={(e) => patch(selected.type === "email" ? { subject: e.target.value } : { title: e.target.value })} />
+                      <input
+                        className={inputCls}
+                        disabled={!editable}
+                        value={subjectValue}
+                        onChange={(e) => (armIsA ? patch({ subject: e.target.value }) : patchArm(armIdx, { subject: e.target.value }))}
+                      />
                     </Field>
 
                     {selected.type === "email" && (
@@ -316,19 +709,25 @@ export function CampaignDetail({ id, onBack, toast }: { id: string; onBack: () =
                         <div>
                           <div className="mb-1.5 flex items-center justify-between">
                             <span className="text-[11px] font-medium uppercase tracking-wider text-slate-500">A/B variants</span>
-                            <span className="text-[11px] text-slate-500">50 / 50 split</span>
+                            {splitLabel && <span className="text-[11px] text-slate-500">{splitLabel}</span>}
                           </div>
                           <div className="flex gap-2">
-                            {(selected.variants ?? [{ id: "only", label: "Variant A", share: 100, subject: "", body: "" }]).map((v, i) => (
+                            {arms.map((v, i) => (
                               <button key={v.id} onClick={() => setVariantIdx(i)}
-                                className={`flex-1 rounded-lg border px-3 py-2 text-left transition ${variantIdx === i ? "border-brand-500/60 bg-brand-500/10" : "border-ink-600 hover:bg-white/5"}`}>
+                                className={`flex-1 rounded-lg border px-3 py-2 text-left transition ${armIdx === i ? "border-brand-500/60 bg-brand-500/10" : "border-ink-600 hover:bg-white/5"}`}>
                                 <p className="text-[11px] font-medium text-white">{v.label}</p>
                                 <p className="text-[10px] text-slate-500">{v.share}% traffic</p>
                               </button>
                             ))}
-                            <button className="grid w-10 place-items-center rounded-lg border border-dashed border-ink-600 text-slate-500 hover:border-brand-500/50 hover:text-brand-300">
-                              <Icon name="plus" className="h-3.5 w-3.5" />
-                            </button>
+                            {editable && (
+                              <button
+                                onClick={addVariant}
+                                disabled={saving}
+                                className="grid w-10 place-items-center rounded-lg border border-dashed border-ink-600 text-slate-500 hover:border-brand-500/50 hover:text-brand-300"
+                              >
+                                <Icon name="plus" className="h-3.5 w-3.5" />
+                              </button>
+                            )}
                           </div>
                         </div>
 
@@ -345,14 +744,15 @@ export function CampaignDetail({ id, onBack, toast }: { id: string; onBack: () =
                           </div>
                           <textarea
                             rows={9}
-                            value={selected.body ?? ""}
-                            onChange={(e) => patch({ body: e.target.value })}
-                            className="w-full resize-y rounded-lg border border-ink-600 bg-ink-850 p-3 text-[13px] leading-relaxed text-slate-200 outline-none transition focus:border-brand-500/60 focus:ring-2 focus:ring-brand-500/20"
+                            disabled={!editable}
+                            value={bodyValue}
+                            onChange={(e) => (armIsA ? patch({ body: e.target.value }) : patchArm(armIdx, { body: e.target.value }))}
+                            className="w-full resize-y rounded-lg border border-ink-600 bg-ink-850 p-3 text-[13px] leading-relaxed text-slate-200 outline-none transition focus:border-brand-500/60 focus:ring-2 focus:ring-brand-500/20 disabled:opacity-60"
                           />
                           <div className="mt-1.5 flex items-center justify-between text-[10.5px]">
-                            <span className="text-slate-600">{(selected.body ?? "").length} chars · {(selected.body ?? "").split(/\s+/).filter(Boolean).length} words</span>
-                            <span className={((selected.body ?? "").length > 900 ? "text-amber-400" : "text-emerald-400")}>
-                              {(selected.body ?? "").length > 900 ? "Too long for cold email" : "Good length"}
+                            <span className="text-slate-600">{bodyValue.length} chars · {bodyValue.split(/\s+/).filter(Boolean).length} words</span>
+                            <span className={bodyValue.length > 900 ? "text-amber-400" : "text-emerald-400"}>
+                              {bodyValue.length > 900 ? "Too long for cold email" : "Good length"}
                             </span>
                           </div>
                         </div>
@@ -360,27 +760,19 @@ export function CampaignDetail({ id, onBack, toast }: { id: string; onBack: () =
                         <div>
                           <p className="mb-1.5 text-[11px] font-medium uppercase tracking-wider text-slate-500">Insert variable</p>
                           <div className="flex flex-wrap gap-1.5">
-                            {firstNameVars.map((v) => (
+                            {fields.map((v) => (
                               <button key={v}
-                                onClick={() => patch({ body: `${selected.body ?? ""}{{${v}}}` })}
-                                className="rounded-md bg-white/[0.06] px-2 py-1 font-mono text-[10.5px] text-brand-200 ring-1 ring-inset ring-white/10 transition hover:bg-brand-500/20">
+                                disabled={!editable}
+                                onClick={() => (armIsA ? patch({ body: `${bodyValue}{{${v}}}` }) : patchArm(armIdx, { body: `${bodyValue}{{${v}}}` }))}
+                                className="rounded-md bg-white/[0.06] px-2 py-1 font-mono text-[10.5px] text-brand-200 ring-1 ring-inset ring-white/10 transition hover:bg-brand-500/20 disabled:opacity-50">
                                 {`{{${v}}}`}
                               </button>
                             ))}
-                            <button onClick={() => toast("AI rewrote the email in your tone of voice", "violet")}
-                              className="flex items-center gap-1 rounded-md bg-violet-500/15 px-2 py-1 text-[10.5px] font-medium text-violet-200 ring-1 ring-inset ring-violet-500/25 hover:bg-violet-500/25">
-                              <Icon name="sparkles" className="h-3 w-3" /> Rewrite with AI
-                            </button>
+                            {/* "Rewrite with AI": no rewrite endpoint — hidden. */}
                           </div>
                         </div>
 
-                        <div className="flex items-center justify-between rounded-lg border border-ink-700 bg-ink-900/50 px-3 py-2.5">
-                          <div>
-                            <p className="text-[12px] font-medium text-slate-200">Track opens & clicks</p>
-                            <p className="text-[10.5px] text-slate-500">Adds a pixel + redirect wrapper</p>
-                          </div>
-                          <Toggle on onChange={() => {}} />
-                        </div>
+                        {/* "Track opens & clicks": the backend has no open/click tracking — hidden. */}
                       </>
                     )}
 
@@ -398,103 +790,115 @@ export function CampaignDetail({ id, onBack, toast }: { id: string; onBack: () =
                     {selected.enabled ? "Active in rotation" : "Paused step"}
                   </div>
                   <div className="flex gap-2">
-                    <Button size="sm" variant="ghost" icon="copy" onClick={() => { setSteps((prev) => [...prev, { ...selected, id: Math.random().toString(36).slice(2) }]); toast("Step duplicated", "brand"); }}>Duplicate</Button>
-                    <Button size="sm" variant="primary" icon="check" onClick={() => toast("Step saved", "emerald")}>Save</Button>
+                    {editable && (
+                      <Button size="sm" variant="ghost" icon="copy" onClick={duplicateStep}>Duplicate</Button>
+                    )}
+                    <Button size="sm" variant="primary" icon="check" disabled={!editable || saving} onClick={save}>
+                      {saving ? "Saving…" : "Save"}
+                    </Button>
                   </div>
                 </div>
               </Card>
             )}
 
             {/* preview */}
-            <Card pad={false}>
-              <div className="flex items-center justify-between border-b border-ink-700 px-4 py-3">
-                <span className="text-[13px] font-medium text-white">Inbox preview</span>
-                <div className="flex items-center gap-1 rounded-lg border border-ink-700 bg-ink-900 p-0.5">
-                  {(["desktop", "mobile"] as const).map((d) => (
-                    <button key={d} onClick={() => setDevice(d)}
-                      className={`grid h-6 w-7 place-items-center rounded ${device === d ? "bg-white/[0.09] text-white" : "text-slate-500"}`}>
-                      <Icon name={d === "desktop" ? "monitor" : "smartphone"} className="h-3.5 w-3.5" />
-                    </button>
-                  ))}
-                </div>
-              </div>
-              <div className="p-4">
-                <div className={`mx-auto rounded-xl border border-ink-600 bg-white/[0.03] transition-all ${device === "mobile" ? "max-w-[280px]" : "max-w-full"}`}>
-                  <div className="flex items-center gap-2 border-b border-ink-700 px-3.5 py-2.5">
-                    <Avatar name={campaign.owner} hue={255} size={26} />
-                    <div className="min-w-0">
-                      <p className="truncate text-[11.5px] font-medium text-white">Alex Rivera <span className="text-slate-500">&lt;alex@northwind.io&gt;</span></p>
-                      <p className="truncate text-[10.5px] text-slate-500">to sarah.w@lumenstack.com</p>
-                    </div>
-                  </div>
-                  <div className="px-3.5 py-3">
-                    <p className="mb-2 text-[13px] font-semibold text-white">
-                      {(selected?.subject ?? "").replace(/\{\{first_name\}\}/g, "Sarah").replace(/\{\{company\}\}/g, "Lumenstack")}
-                    </p>
-                    <div className="text-[12.5px] text-slate-400">{renderPreview(selected?.body ?? "")}</div>
-                    <div className="mt-3 flex gap-2 border-t border-ink-700 pt-3 text-[10.5px] text-slate-600">
-                      <span className="flex items-center gap-1"><Icon name="reply" className="h-3 w-3" /> Reply</span>
-                      <span className="flex items-center gap-1"><Icon name="clock" className="h-3 w-3" /> Snooze</span>
-                      <span className="flex items-center gap-1"><Icon name="archive" className="h-3 w-3" /> Archive</span>
-                    </div>
+            {previewLead && (
+              <Card pad={false}>
+                <div className="flex items-center justify-between border-b border-ink-700 px-4 py-3">
+                  <span className="text-[13px] font-medium text-white">Inbox preview</span>
+                  <div className="flex items-center gap-1 rounded-lg border border-ink-700 bg-ink-900 p-0.5">
+                    {(["desktop", "mobile"] as const).map((d) => (
+                      <button key={d} onClick={() => setDevice(d)}
+                        className={`grid h-6 w-7 place-items-center rounded ${device === d ? "bg-white/[0.09] text-white" : "text-slate-500"}`}>
+                        <Icon name={d === "desktop" ? "monitor" : "smartphone"} className="h-3.5 w-3.5" />
+                      </button>
+                    ))}
                   </div>
                 </div>
-                <div className="mt-3 flex items-center gap-2 rounded-lg bg-emerald-500/[0.07] p-2.5 text-[11px] text-emerald-300 ring-1 ring-inset ring-emerald-500/20">
-                  <Icon name="shield" className="h-3.5 w-3.5 shrink-0" />
-                  No spam triggers detected. SpamAssassin score 0.8 / 5 · 2 links · no heavy images.
+                <div className="p-4">
+                  <div className={`mx-auto rounded-xl border border-ink-600 bg-white/[0.03] transition-all ${device === "mobile" ? "max-w-[280px]" : "max-w-full"}`}>
+                    <div className="flex items-center gap-2 border-b border-ink-700 px-3.5 py-2.5">
+                      {senderBox ? (
+                        <>
+                          <Avatar name={senderBox.from_name || senderBox.from_email.split("@")[0]} hue={(senderBox.from_email.charCodeAt(0) * 7) % 360} size={26} />
+                          <div className="min-w-0">
+                            <p className="truncate text-[11.5px] font-medium text-white">
+                              {senderBox.from_name || senderBox.from_email} <span className="text-slate-500">&lt;{senderBox.from_email}&gt;</span>
+                            </p>
+                            <p className="truncate text-[10.5px] text-slate-500">to {previewLead.email}</p>
+                          </div>
+                        </>
+                      ) : (
+                        <div className="min-w-0">
+                          <p className="truncate text-[11.5px] font-medium text-white">to {previewLead.email}</p>
+                          <p className="truncate text-[10.5px] text-slate-500">No sending account assigned yet</p>
+                        </div>
+                      )}
+                    </div>
+                    <div className="px-3.5 py-3">
+                      <p className="mb-2 text-[13px] font-semibold text-white">{preview?.subject ?? (previewLoading ? "Rendering…" : "")}</p>
+                      <div className="text-[12.5px] text-slate-400">
+                        {preview?.merge_error ? (
+                          <p className="text-amber-300">Merge error: {preview.merge_error}</p>
+                        ) : previewLoading && !preview ? (
+                          <p className="text-slate-500">Rendering preview…</p>
+                        ) : selectedPos < 1 ? (
+                          <p className="text-slate-500">Save this new step to preview it.</p>
+                        ) : preview ? (
+                          renderLines(preview.body ?? "")
+                        ) : (
+                          <p className="text-slate-500">Preview unavailable.</p>
+                        )}
+                      </div>
+                      <div className="mt-3 flex gap-2 border-t border-ink-700 pt-3 text-[10.5px] text-slate-600">
+                        <span className="flex items-center gap-1"><Icon name="reply" className="h-3 w-3" /> Reply</span>
+                        <span className="flex items-center gap-1"><Icon name="clock" className="h-3 w-3" /> Snooze</span>
+                        <span className="flex items-center gap-1"><Icon name="archive" className="h-3 w-3" /> Archive</span>
+                      </div>
+                    </div>
+                  </div>
+                  {/* SpamAssassin claim: no spam scanner in the API — hidden. */}
                 </div>
-              </div>
-            </Card>
+              </Card>
+            )}
           </div>
         </div>
       )}
 
       {tab === "Overview" && (
         <div className="grid gap-4 xl:grid-cols-3">
-          <Card className="xl:col-span-2">
-            <SectionTitle title="Daily volume" sub="Sends vs. opens vs. replies" right={<Badge tone="brand">Last 7 days</Badge>} />
-            <AreaChart
-              data={rangeSeries["30d"]}
-              series={[
-                { key: "sent", color: "#6366f1", name: "Sent" },
-                { key: "opened", color: "#22d3ee", name: "Opened" },
-                { key: "replied", color: "#34d399", name: "Replied" },
-              ]}
-            />
-          </Card>
+          {/* "Daily volume" chart: the API has no time series — hidden. */}
           <div className="space-y-4">
             <Card>
               <SectionTitle title="Engagement split" />
               <div className="flex items-center gap-4">
                 <Donut
                   segments={[
-                    { label: "Opened", value: campaign.opened, color: "#22d3ee" },
-                    { label: "Unopened", value: campaign.sent - campaign.opened, color: "#334155" },
+                    { label: "Replied", value: stats.replied, color: "#34d399" },
+                    { label: "No reply", value: Math.max(0, stats.contacted - stats.replied), color: "#64748b" },
                   ]}
-                  center={{ top: `${p(campaign.opened, campaign.sent)}%`, bottom: "opened" }}
+                  center={{ top: `${stats.reply_rate}%`, bottom: "reply rate" }}
                 />
                 <div className="flex-1 space-y-2 text-[12px]">
-                  <div className="flex justify-between"><span className="text-slate-400">Opened</span><span className="text-white">{campaign.opened.toLocaleString()}</span></div>
-                  <div className="flex justify-between"><span className="text-slate-400">Unopened</span><span className="text-slate-300">{(campaign.sent - campaign.opened).toLocaleString()}</span></div>
-                  <div className="flex justify-between"><span className="text-slate-400">Replied</span><span className="text-emerald-300">{campaign.replied.toLocaleString()}</span></div>
-                  <div className="flex justify-between"><span className="text-slate-400">Unsubscribed</span><span className="text-rose-300">{campaign.unsubscribed}</span></div>
+                  <div className="flex justify-between"><span className="text-slate-400">Replied</span><span className="text-emerald-300">{stats.replied.toLocaleString()}</span></div>
+                  <div className="flex justify-between"><span className="text-slate-400">No reply</span><span className="text-slate-300">{Math.max(0, stats.contacted - stats.replied).toLocaleString()}</span></div>
+                  <div className="flex justify-between"><span className="text-slate-400">Unsubscribed</span><span className="text-rose-300">{stats.unsubscribed}</span></div>
                 </div>
               </div>
             </Card>
-            <Card>
-              <SectionTitle title="Top performing variant" />
-              <div className="space-y-3">
-                {[
-                  ["Variant A — “quick idea”", 9.8, "brand"],
-                  ["Variant B — “6 AEs”", 7.4, "sky"],
-                ].map(([l, v, t]) => (
-                  <div key={l as string}>
-                    <div className="mb-1 flex justify-between text-[12px]"><span className="text-slate-300">{l}</span><span className="font-semibold text-white">{v}%</span></div>
-                    <Progress value={(v as number) * 10} tone={t as string} />
-                  </div>
-                ))}
-              </div>
-            </Card>
+            {variantRows.length > 0 && (
+              <Card>
+                <SectionTitle title="Top performing variant" />
+                <div className="space-y-3">
+                  {variantRows.map((v) => (
+                    <div key={v.key}>
+                      <div className="mb-1 flex justify-between text-[12px]"><span className="text-slate-300">{v.label}</span><span className="font-semibold text-white">{v.rate}%</span></div>
+                      <Progress value={Math.min(100, v.rate * 10)} tone="brand" />
+                    </div>
+                  ))}
+                </div>
+              </Card>
+            )}
           </div>
         </div>
       )}
@@ -502,37 +906,54 @@ export function CampaignDetail({ id, onBack, toast }: { id: string; onBack: () =
       {tab === "Leads" && (
         <Card pad={false}>
           <div className="flex flex-wrap items-center gap-2 p-4">
-            <input placeholder="Search leads in this campaign…" className="h-9 w-64 rounded-lg border border-ink-700 bg-ink-900/70 px-3 text-[13px] text-slate-200 placeholder:text-slate-600 outline-none focus:border-brand-500/60" />
-            <Button variant="default" icon="filter" size="sm">Filters</Button>
-            <Button variant="default" icon="upload" size="sm">Add leads</Button>
-            <span className="ml-auto text-[11.5px] text-slate-500">{relatedLeads.length} of {campaign.leads.toLocaleString()} leads</span>
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search leads in this campaign…"
+              className="h-9 w-64 rounded-lg border border-ink-700 bg-ink-900/70 px-3 text-[13px] text-slate-200 placeholder:text-slate-600 outline-none focus:border-brand-500/60"
+            />
+            {/* "Filters": no filter options exist beyond search — hidden. */}
+            <Button variant="default" icon="upload" size="sm" onClick={() => setImportOpen(true)}>Add leads</Button>
+            <span className="ml-auto text-[11.5px] text-slate-500">{leadsLoading ? "Loading…" : `${shownLeads.length} of ${leadsTotal.toLocaleString()} leads`}</span>
           </div>
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-[760px] text-left">
-              <thead>
-                <tr className="text-[10px] uppercase tracking-wider text-slate-500">
-                  {["", "Lead", "Stage", "Status", "Last activity", "Score"].map((h, i) => <th key={i} className="px-4 pb-2 font-medium">{h}</th>)}
-                </tr>
-              </thead>
-              <tbody>
-                {relatedLeads.map((l) => (
-                  <tr key={l.id} className="border-t border-ink-700/60 transition hover:bg-white/[0.025]">
-                    <td className="w-10 px-4"><input type="checkbox" className="h-4 w-4 rounded accent-brand-500" /></td>
-                    <td className="px-4 py-3">
-                      <div className="flex items-center gap-2.5">
-                        <Avatar name={l.name} hue={l.avatarHue} size={30} />
-                        <div><p className="text-[13px] font-medium text-white">{l.name}</p><p className="text-[11px] text-slate-500">{l.email}</p></div>
-                      </div>
-                    </td>
-                    <td className="px-4 text-[12.5px] text-slate-300">{l.stage}</td>
-                    <td className="px-4"><Badge tone={l.status === "replied" ? "emerald" : l.status === "bounced" ? "rose" : l.status === "paused" ? "amber" : "slate"}>{l.status}</Badge></td>
-                    <td className="px-4 text-[12px] text-slate-500">{l.lastActivity}</td>
-                    <td className="px-4 text-[13px] font-semibold text-white">{l.score}</td>
+          {leadsError ? (
+            <div className="px-4 pb-6 text-center text-[12px] text-slate-400">
+              <p>{leadsError}</p>
+              <button onClick={() => setLeadsKey((k) => k + 1)} className="mt-2 text-brand-300 hover:text-brand-200">Retry</button>
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[760px] text-left">
+                <thead>
+                  <tr className="text-[10px] uppercase tracking-wider text-slate-500">
+                    {["Lead", "Stage", "Status", "Last activity", "Score"].map((h) => <th key={h} className="px-4 pb-2 font-medium">{h}</th>)}
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {leadsLoading && (
+                    <tr><td colSpan={5} className="px-4 py-8 text-center text-[12px] text-slate-500">Loading leads…</td></tr>
+                  )}
+                  {!leadsLoading && shownLeads.length === 0 && (
+                    <tr><td colSpan={5} className="px-4 py-8 text-center text-[12px] text-slate-500">No leads in this campaign yet.</td></tr>
+                  )}
+                  {shownLeads.map((l) => (
+                    <tr key={l.id} className="border-t border-ink-700/60 transition hover:bg-white/[0.025]">
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-2.5">
+                          <Avatar name={l.name} hue={l.avatarHue} size={30} />
+                          <div><p className="text-[13px] font-medium text-white">{l.name}</p><p className="text-[11px] text-slate-500">{l.email}</p></div>
+                        </div>
+                      </td>
+                      <td className="px-4 text-[12.5px] text-slate-300">{l.stage}</td>
+                      <td className="px-4"><Badge tone={l.status === "replied" ? "emerald" : l.status === "bounced" ? "rose" : l.status === "paused" ? "amber" : "slate"}>{l.status}</Badge></td>
+                      <td className="px-4 text-[12px] text-slate-500">{l.lastActivity}</td>
+                      <td className="px-4 text-[13px] font-semibold text-white">{l.score}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </Card>
       )}
 
@@ -542,47 +963,61 @@ export function CampaignDetail({ id, onBack, toast }: { id: string; onBack: () =
             <SectionTitle title="Sending window" sub="Times shown in leads' local timezone" />
             <div className="space-y-4">
               <div className="grid grid-cols-2 gap-3">
-                <Field label="Start"><input className={inputCls} defaultValue="09:00" /></Field>
-                <Field label="End"><input className={inputCls} defaultValue="17:00" /></Field>
+                <Field label="Start"><input className={inputCls} disabled={!editable} value={`${String(startDraft).padStart(2, "0")}:00`} onChange={(e) => {
+                  const h = Number(e.target.value.split(":")[0]);
+                  if (Number.isInteger(h) && h >= 0 && h < 24) setStartDraft(h);
+                }} /></Field>
+                <Field label="End"><input className={inputCls} disabled={!editable} value={`${String(endDraft).padStart(2, "0")}:00`} onChange={(e) => {
+                  const h = Number(e.target.value.split(":")[0]);
+                  if (Number.isInteger(h) && h >= 1 && h <= 24) setEndDraft(h);
+                }} /></Field>
               </div>
               <div>
                 <p className="mb-2 text-[11px] uppercase tracking-wider text-slate-500">Days</p>
                 <div className="flex flex-wrap gap-2">
                   {["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((d, i) => (
-                    <button key={d} className={`h-9 w-12 rounded-lg border text-[12px] transition ${i < 5 ? "border-brand-500/60 bg-brand-500/10 text-brand-200" : "border-ink-600 text-slate-500"}`}>{d}</button>
+                    <button
+                      key={d}
+                      disabled={!editable}
+                      onClick={() => setDaysDraft((cur) => (cur.includes(i) ? cur.filter((x) => x !== i) : [...cur, i]))}
+                      className={`h-9 w-12 rounded-lg border text-[12px] transition ${daysDraft.includes(i) ? "border-brand-500/60 bg-brand-500/10 text-brand-200" : "border-ink-600 text-slate-500"} disabled:opacity-60`}
+                    >{d}</button>
                   ))}
                 </div>
               </div>
-              <div>
-                <div className="mb-1.5 flex justify-between text-[11.5px]"><span className="text-slate-400">Emails per day (total)</span><span className="font-medium text-white">{campaign.dailyLimit}</span></div>
-                <input type="range" min={0} max={1000} defaultValue={campaign.dailyLimit} className="w-full accent-brand-500" />
-                <div className="mt-2 flex justify-between text-[10.5px] text-slate-600"><span>0</span><span>500</span><span>1000</span></div>
-              </div>
-              {[["Randomize send interval", true], ["Pause on out-of-office reply", true], ["Auto-pause on high bounce", true], ["Send follow-up to auto-replies", false]].map(([l, v]) => (
-                <div key={l as string} className="flex items-center justify-between rounded-lg border border-ink-700 px-3 py-2.5">
-                  <span className="text-[12.5px] text-slate-300">{l}</span>
-                  <Toggle on={v as boolean} />
-                </div>
-              ))}
-              <Button variant="primary" icon="check" className="w-full" onClick={() => toast("Schedule updated", "emerald")}>Save schedule</Button>
+              {/* "Emails per day (total)" slider: no campaign-level daily limit exists — hidden. */}
+              {/* Send-interval / OOO / bounce toggles: not configurable via the API — hidden. */}
+              <Button variant="primary" icon="check" className="w-full" disabled={!editable || saving} onClick={saveSchedule}>
+                {saving ? "Saving…" : "Save schedule"}
+              </Button>
             </div>
           </Card>
           <Card>
-            <SectionTitle title="This week's plan" sub="Projected sends per inbox" />
+            <SectionTitle title="This week's plan" sub="Daily cap per assigned inbox" />
             <div className="space-y-3">
-              {campaign.accounts.map((a, i) => (
-                <div key={a} className="rounded-xl border border-ink-700/70 bg-ink-850/50 p-3">
-                  <div className="flex items-center gap-2.5">
-                    <Avatar name={a.split("@")[0]} hue={(a.charCodeAt(0) * 7) % 360} size={28} />
-                    <div className="min-w-0 flex-1">
-                      <p className="truncate text-[12.5px] font-medium text-white">{a}</p>
-                      <p className="text-[10.5px] text-slate-500">{Math.round(campaign.dailyLimit / campaign.accounts.length)} sends/day · {["Mon–Fri 9–5", "Mon–Thu 8–4", "Tue–Fri 10–6"][i % 3]}</p>
+              {detail.mailboxes.length === 0 && (
+                <p className="rounded-xl border border-dashed border-ink-700 px-4 py-8 text-center text-[12.5px] text-slate-500">
+                  No sending accounts assigned to this campaign yet.
+                </p>
+              )}
+              {detail.mailboxes.map((m) => {
+                const state = api.toMailbox(m);
+                return (
+                  <div key={m.id} className="rounded-xl border border-ink-700/70 bg-ink-850/50 p-3">
+                    <div className="flex items-center gap-2.5">
+                      <Avatar name={m.from_email.split("@")[0]} hue={(m.from_email.charCodeAt(0) * 7) % 360} size={28} />
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-[12.5px] font-medium text-white">{m.from_email}</p>
+                        <p className="text-[10.5px] text-slate-500">{state.dailyLimit} sends/day · {daysShort} {detail.campaign.window_start_hour}:00–{detail.campaign.window_end_hour}:00</p>
+                      </div>
+                      <Badge tone={state.status === "healthy" ? "emerald" : state.status === "warming" ? "amber" : state.status === "error" ? "rose" : "slate"}>{state.status}</Badge>
                     </div>
-                    <Badge tone="emerald">healthy</Badge>
+                    <div className="mt-2.5">
+                      <Progress value={state.dailyLimit ? (m.today_sent / state.dailyLimit) * 100 : 0} tone={m.today_sent / (state.dailyLimit || 1) > 0.85 ? "amber" : "brand"} />
+                    </div>
                   </div>
-                  <div className="mt-2.5"><Progress value={40 + i * 15} tone={i % 2 ? "sky" : "brand"} /></div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </Card>
         </div>
@@ -593,32 +1028,23 @@ export function CampaignDetail({ id, onBack, toast }: { id: string; onBack: () =
           <Card>
             <SectionTitle title="General" />
             <div className="space-y-3.5">
-              <Field label="Campaign name"><input className={inputCls} defaultValue={campaign.name} /></Field>
-              <Field label="Owner"><select className={inputCls}><option>Alex Rivera</option><option>Maya Chen</option><option>Leo Novak</option></select></Field>
-              <Field label="Tags">
-                <div className="flex flex-wrap gap-1.5">
-                  {[...campaign.tags, "outbound"].map((t) => (
-                    <span key={t} className="flex items-center gap-1 rounded-md bg-white/[0.06] px-2 py-1 text-[11px] text-slate-300 ring-1 ring-inset ring-white/10">
-                      {t}<button className="text-slate-500 hover:text-rose-300"><Icon name="x" className="h-3 w-3" /></button>
-                    </span>
-                  ))}
-                  <button className="rounded-md border border-dashed border-ink-600 px-2 py-1 text-[11px] text-slate-500 hover:text-white">+ add</button>
-                </div>
+              <Field label="Campaign name">
+                <input className={inputCls} disabled={!editable} value={nameDraft} onChange={(e) => setNameDraft(e.target.value)} />
               </Field>
+              {/* Owner and tags: no columns in the API — hidden. */}
             </div>
           </Card>
           <Card>
             <SectionTitle title="Sequence rules" />
             <div className="space-y-3">
-              {[["Stop sequence on reply", true], ["Stop on positive reply only", false], ["Exclude unsubscribed domain-wide", true], ["Restart sequence for re-engaged leads", false], ["Notify me on every reply", true], ["Auto-assign replies to round-robin owners", false]].map(([l, v]) => (
-                <div key={l as string} className="flex items-center justify-between rounded-lg border border-ink-700 px-3 py-2.5">
-                  <span className="text-[12.5px] text-slate-300">{l}</span>
-                  <Toggle on={v as boolean} />
-                </div>
-              ))}
+              {/* Stop/restart/notify rules: not configurable via the API — hidden. */}
               <div className="flex gap-2 pt-1">
-                <Button variant="danger" icon="trash" onClick={() => toast("Archive requires owner confirmation", "amber")}>Archive</Button>
-                <Button variant="primary" icon="check" className="flex-1" onClick={() => toast("Settings saved", "emerald")}>Save changes</Button>
+                <Button variant="danger" icon="trash" disabled={!editable || acting} onClick={archive}>
+                  {acting ? "Working…" : "Archive"}
+                </Button>
+                <Button variant="primary" icon="check" className="flex-1" disabled={!editable || saving} onClick={saveSettings}>
+                  {saving ? "Saving…" : "Save changes"}
+                </Button>
               </div>
             </div>
           </Card>
@@ -626,17 +1052,63 @@ export function CampaignDetail({ id, onBack, toast }: { id: string; onBack: () =
       )}
 
       {/* more campaigns */}
-      <div className="pt-2">
-        <div className="mb-3 flex items-center justify-between">
-          <h3 className="text-[15px] font-semibold tracking-tight text-white">Other campaigns</h3>
-          <Button size="sm" variant="ghost" onClick={onBack} icon="chevronRight">View all</Button>
+      {others.length > 0 && (
+        <div className="pt-2">
+          <div className="mb-3 flex items-center justify-between">
+            <h3 className="text-[15px] font-semibold tracking-tight text-white">Other campaigns</h3>
+            <Button size="sm" variant="ghost" onClick={onBack} icon="chevronRight">View all</Button>
+          </div>
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+            {others.map((c) => (
+              <CampaignCard key={c.id} c={c} onOpen={onBack} view="grid" />
+            ))}
+          </div>
         </div>
-        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-          {campaigns.filter((c) => c.id !== campaign.id).slice(0, 3).map((c) => (
-            <CampaignCard key={c.id} c={c} onOpen={onBack} view="grid" />
-          ))}
+      )}
+
+      {/* import modal */}
+      {importOpen && (
+        <div className="fixed inset-0 z-50 grid place-items-center p-4">
+          <div className="absolute inset-0 bg-black/70 backdrop-blur-sm animate-fade-in" onClick={() => setImportOpen(false)} />
+          <div className="relative w-full max-w-lg animate-pop rounded-2xl border border-ink-600 bg-ink-850 shadow-2xl">
+            <div className="flex items-center justify-between border-b border-ink-700 px-5 py-4">
+              <h3 className="text-sm font-semibold text-white">Add leads to {campaign.name}</h3>
+              <button onClick={() => setImportOpen(false)} className="rounded-md p-1 text-slate-500 hover:bg-white/5 hover:text-white"><Icon name="x" /></button>
+            </div>
+            <div className="space-y-4 p-5">
+              <div
+                onClick={() => fileRef.current?.click()}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={(e) => { e.preventDefault(); readCsv(e.dataTransfer.files?.[0]); }}
+                className="grid cursor-pointer place-items-center rounded-xl border border-dashed border-ink-600 bg-ink-900/50 px-4 py-10 text-center transition hover:border-brand-500/50"
+              >
+                <div className="grid h-12 w-12 place-items-center rounded-2xl bg-brand-500/12 text-brand-300"><Icon name="upload" className="h-5 w-5" /></div>
+                <p className="mt-3 text-[13px] font-medium text-white">{importFile ? importFile.name : "Drop your CSV here"}</p>
+                <p className="mt-1 text-[11.5px] text-slate-500">{importFile ? "Ready to import" : "or click to browse"}</p>
+                <Button variant="default" size="sm" className="mt-3">{importFile ? "Choose another file" : "Choose file"}</Button>
+                <input
+                  ref={fileRef}
+                  type="file"
+                  accept=".csv,text/csv"
+                  className="hidden"
+                  onChange={(e) => readCsv(e.target.files?.[0])}
+                />
+              </div>
+              <label className="flex items-start gap-2 text-[11.5px] leading-relaxed text-slate-400">
+                <input type="checkbox" checked={lawful} onChange={(e) => setLawful(e.target.checked)} className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-brand-500" />
+                I confirm I have a lawful basis to email these contacts and will honor opt-outs.
+              </label>
+              <div className="rounded-lg bg-white/[0.03] p-3 text-[11.5px] leading-relaxed text-slate-500">
+                Required column: <code className="font-mono text-brand-200">email</code>. Optional: first_name, last_name, company, title, linkedin_url, custom variables.
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 border-t border-ink-700 px-5 py-3.5">
+              <Button variant="default" onClick={() => setImportOpen(false)}>Cancel</Button>
+              <Button variant="primary" icon="check" disabled={importing} onClick={startImport}>{importing ? "Importing…" : "Start import"}</Button>
+            </div>
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

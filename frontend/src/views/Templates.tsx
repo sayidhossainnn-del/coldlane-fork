@@ -1,18 +1,90 @@
-import { useState } from "react";
-import { Card, SectionTitle, Badge, Button, Icon, Field, inputCls, Tabs, Progress, Avatar } from "../components/ui";
-import { templates as seed, campaigns } from "../lib/data";
+import { useEffect, useState } from "react";
+import { Card, SectionTitle, Button, Icon, Field, inputCls, Avatar } from "../components/ui";
+import * as api from "../lib/api";
+import { firstNameVars } from "../lib/data";
 import type { Template } from "../lib/data";
 
-const CATS = ["All", "Cold intro", "Follow-up", "Breakup", "Warm"];
+const emptyTemplate = (): Template => ({ id: "new", name: "", category: "", subject: "", body: "", used: 0, replyRate: 0, updated: "now" });
+
+function wordStats(body: string) {
+  const words = body.trim() ? body.trim().split(/\s+/).filter(Boolean).length : 0;
+  const links = (body.match(/https?:\/\//g) ?? []).length;
+  return `${words} words · ${links} link${links === 1 ? "" : "s"}`;
+}
 
 export function Templates({ toast }: { toast: (m: string, t?: string) => void }) {
-  const [list, setList] = useState(seed);
-  const [cat, setCat] = useState("All");
+  const [list, setList] = useState<Template[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [editor, setEditor] = useState<Template | null>(null);
+  const [saving, setSaving] = useState(false);
   const [device, setDevice] = useState<"desktop" | "mobile">("desktop");
+  const [sender, setSender] = useState<{ name: string; email: string } | null>(null);
 
-  const shown = list.filter((t) => (cat === "All" || t.category === cat) && (t.name + t.subject).toLowerCase().includes(query.toLowerCase()));
+  const load = () => {
+    setLoading(true);
+    setLoadError(null);
+    api
+      .listTemplates()
+      .then(setList)
+      .catch((err) => setLoadError(api.errorMessage(err)))
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    load();
+    // The preview header shows a real connected mailbox as sender (never a fake person).
+    api
+      .listMailboxRows()
+      .then((rows) => {
+        const first = rows[0];
+        if (first) setSender({ name: first.from_name || first.from_email.split("@")[0], email: first.from_email });
+      })
+      .catch(() => undefined);
+  }, []);
+
+  const shown = list.filter((t) => (t.name + t.subject).toLowerCase().includes(query.toLowerCase()));
+
+  const save = () => {
+    if (!editor || saving) return;
+    const name = editor.name.trim();
+    if (!name) {
+      toast("Template name is required.", "rose");
+      return;
+    }
+    setSaving(true);
+    const payload = { name, subject: editor.subject, body: editor.body };
+    const call = editor.id === "new" ? api.createTemplate(payload) : api.updateTemplate(editor.id, payload);
+    call
+      .then((saved) => {
+        setList((l) => (editor.id === "new" ? [saved, ...l] : l.map((x) => (x.id === saved.id ? saved : x))));
+        setEditor(null);
+        toast("Template saved", "emerald");
+      })
+      .catch((err) => toast(api.errorMessage(err), "rose"))
+      .finally(() => setSaving(false));
+  };
+
+  const duplicate = (t: Template) => {
+    api
+      .createTemplate({ name: `${t.name} (copy)`, subject: t.subject, body: t.body })
+      .then((copy) => {
+        setList((l) => [copy, ...l]);
+        toast("Template duplicated", "brand");
+      })
+      .catch((err) => toast(api.errorMessage(err), "rose"));
+  };
+
+  const remove = (t: Template) => {
+    api
+      .deleteTemplate(t.id)
+      .then(() => {
+        setList((l) => l.filter((x) => x.id !== t.id));
+        toast("Template deleted", "rose");
+      })
+      .catch((err) => toast(api.errorMessage(err), "rose"));
+  };
 
   return (
     <div className="space-y-5">
@@ -22,47 +94,66 @@ export function Templates({ toast }: { toast: (m: string, t?: string) => void })
           <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search templates…"
             className="h-9 w-60 rounded-lg border border-ink-700 bg-ink-900/70 pl-9 pr-3 text-[13px] text-slate-200 placeholder:text-slate-600 outline-none focus:border-brand-500/60" />
         </div>
-        <Tabs tabs={CATS} active={cat} onChange={setCat} />
+        {/* Category filter tabs: the API has no template categories — hidden. */}
         <div className="ml-auto flex gap-2">
-          <Button variant="default" icon="sparkles" onClick={() => toast("AI generated 3 new template drafts", "violet")}>Generate with AI</Button>
-          <Button variant="primary" icon="plus" onClick={() => setEditor({ id: "new", name: "Untitled template", category: "Cold intro", subject: "", body: "", used: 0, replyRate: 0, updated: "now" })}>New template</Button>
+          {/* "Generate with AI": no template-generation endpoint — hidden. */}
+          <Button variant="primary" icon="plus" onClick={() => setEditor(emptyTemplate())}>New template</Button>
         </div>
       </div>
 
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-        {shown.map((t) => (
-          <Card key={t.id} className="group flex flex-col transition-all duration-200 hover:-translate-y-0.5 hover:border-brand-500/40">
-            <div className="flex items-start justify-between gap-3">
-              <div className="flex items-center gap-2.5">
-                <span className="grid h-9 w-9 place-items-center rounded-lg bg-brand-500/10 text-brand-300 ring-1 ring-inset ring-brand-500/20"><Icon name="template" className="h-4 w-4" /></span>
-                <div>
-                  <p className="text-[13.5px] font-semibold text-white group-hover:text-brand-200">{t.name}</p>
-                  <p className="text-[11px] text-slate-500">{t.category} · updated {t.updated}</p>
+      {loading && (
+        <Card className="grid place-items-center py-16">
+          <p className="text-[12px] text-slate-500">Loading templates…</p>
+        </Card>
+      )}
+      {loadError && (
+        <Card className="grid place-items-center py-16 text-center">
+          <p className="text-[12px] text-slate-400">{loadError}</p>
+          <button onClick={load} className="mt-2 text-[12px] text-brand-300 hover:text-brand-200">Retry</button>
+        </Card>
+      )}
+      {!loading && !loadError && shown.length === 0 && (
+        <Card className="grid place-items-center py-16 text-center">
+          <div className="grid h-14 w-14 place-items-center rounded-2xl bg-white/[0.05] text-slate-500"><Icon name="template" className="h-6 w-6" /></div>
+          <p className="mt-4 text-sm font-medium text-white">{list.length === 0 ? "No templates yet" : `No templates match “${query}”`}</p>
+          <p className="mt-1 text-xs text-slate-500">{list.length === 0 ? "Create your first reusable email template." : "Try a different search."}</p>
+        </Card>
+      )}
+
+      {!loading && !loadError && shown.length > 0 && (
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+          {shown.map((t) => (
+            <Card key={t.id} className="group flex flex-col transition-all duration-200 hover:-translate-y-0.5 hover:border-brand-500/40">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-center gap-2.5">
+                  <span className="grid h-9 w-9 place-items-center rounded-lg bg-brand-500/10 text-brand-300 ring-1 ring-inset ring-brand-500/20"><Icon name="template" className="h-4 w-4" /></span>
+                  <div>
+                    <p className="text-[13.5px] font-semibold text-white group-hover:text-brand-200">{t.name}</p>
+                    {/* No category column exists: hidden. */}
+                    <p className="text-[11px] text-slate-500">updated {t.updated}</p>
+                  </div>
                 </div>
+                {/* No per-template reply rate exists: badge hidden. */}
               </div>
-              <Badge tone={t.replyRate > 11 ? "emerald" : t.replyRate > 8 ? "sky" : "slate"}>{t.replyRate}%</Badge>
-            </div>
 
-            <div className="mt-3.5 rounded-xl border border-ink-700/70 bg-ink-850/50 p-3">
-              <p className="mb-1.5 text-[11px] font-medium text-slate-300">Subject</p>
-              <p className="mb-2.5 font-mono text-[11.5px] text-brand-200">{t.subject}</p>
-              <p className="mb-1.5 text-[11px] font-medium text-slate-300">Preview</p>
-              <p className="line-clamp-4 whitespace-pre-line text-[11.5px] leading-relaxed text-slate-500">{t.body}</p>
-            </div>
+              <div className="mt-3.5 rounded-xl border border-ink-700/70 bg-ink-850/50 p-3">
+                <p className="mb-1.5 text-[11px] font-medium text-slate-300">Subject</p>
+                <p className="mb-2.5 font-mono text-[11.5px] text-brand-200">{t.subject || "(no subject)"}</p>
+                <p className="mb-1.5 text-[11px] font-medium text-slate-300">Preview</p>
+                <p className="line-clamp-4 whitespace-pre-line text-[11.5px] leading-relaxed text-slate-500">{t.body}</p>
+              </div>
 
-            <div className="mt-3 flex items-center gap-4 text-[11px] text-slate-500">
-              <span className="flex items-center gap-1.5"><Icon name="send" className="h-3 w-3" />{t.used.toLocaleString()} sends</span>
-              <span className="flex items-center gap-1.5"><Icon name="reply" className="h-3 w-3" />{t.replyRate}% reply</span>
-            </div>
+              {/* Send count and reply rate have no API: stats row hidden. */}
 
-            <div className="mt-3.5 flex gap-2 border-t border-ink-700/60 pt-3">
-              <Button size="sm" variant="default" icon="edit" className="flex-1 justify-center" onClick={() => setEditor(t)}>Edit</Button>
-              <Button size="sm" variant="ghost" icon="copy" onClick={() => { setList([{ ...t, id: Math.random().toString(36).slice(2), name: `${t.name} (copy)` }, ...list]); toast("Template duplicated", "brand"); }} />
-              <Button size="sm" variant="ghost" icon="trash" onClick={() => { setList(list.filter((x) => x.id !== t.id)); toast("Template deleted", "rose"); }} />
-            </div>
-          </Card>
-        ))}
-      </div>
+              <div className="mt-3.5 flex gap-2 border-t border-ink-700/60 pt-3">
+                <Button size="sm" variant="default" icon="edit" className="flex-1 justify-center" onClick={() => setEditor(t)}>Edit</Button>
+                <Button size="sm" variant="ghost" icon="copy" onClick={() => duplicate(t)} />
+                <Button size="sm" variant="ghost" icon="trash" onClick={() => remove(t)} />
+              </div>
+            </Card>
+          ))}
+        </div>
+      )}
 
       <Card>
         <SectionTitle title="Spam-word scan" sub="Avoid these to protect deliverability" />
@@ -86,11 +177,7 @@ export function Templates({ toast }: { toast: (m: string, t?: string) => void })
               <div className="flex-1 space-y-4 overflow-y-auto p-5">
                 <div className="grid gap-3 sm:grid-cols-2">
                   <Field label="Template name"><input className={inputCls} value={editor.name} onChange={(e) => setEditor({ ...editor, name: e.target.value })} /></Field>
-                  <Field label="Category">
-                    <select className={inputCls} value={editor.category} onChange={(e) => setEditor({ ...editor, category: e.target.value })}>
-                      {CATS.slice(1).map((c) => <option key={c}>{c}</option>)}
-                    </select>
-                  </Field>
+                  {/* Category select: no category column in the API — hidden. */}
                 </div>
                 <Field label="Subject line">
                   <input className={inputCls} value={editor.subject} onChange={(e) => setEditor({ ...editor, subject: e.target.value })} placeholder="{{first_name}}, quick idea for {{company}}" />
@@ -110,19 +197,19 @@ export function Templates({ toast }: { toast: (m: string, t?: string) => void })
                 <div>
                   <p className="mb-1.5 text-[11px] font-medium uppercase tracking-wider text-slate-500">Personalisation</p>
                   <div className="flex flex-wrap gap-1.5">
-                    {["first_name", "last_name", "company", "title", "location", "linkedin_url", "custom_1"].map((v) => (
+                    {firstNameVars.map((v) => (
                       <button key={v} onClick={() => setEditor({ ...editor, body: editor.body + `{{${v}}}` })}
                         className="rounded-md bg-white/[0.06] px-2 py-1 font-mono text-[10.5px] text-brand-200 ring-1 ring-inset ring-white/10 hover:bg-brand-500/20">{`{{${v}}}`}</button>
                     ))}
                   </div>
                 </div>
                 <div className="rounded-lg bg-white/[0.03] p-3 text-[11.5px] text-slate-500">
-                  <b className="text-slate-300">Spam score:</b> 1.1 / 5 · 74 words · 0 links. Best practice is under 90 words for cold outreach.
+                  <b className="text-slate-300">Length:</b> {wordStats(editor.body)}. Best practice is under 90 words for cold outreach.
                 </div>
               </div>
               <div className="flex items-center justify-end gap-2 border-t border-ink-700 px-5 py-3.5">
                 <Button variant="default" onClick={() => setEditor(null)}>Cancel</Button>
-                <Button variant="primary" icon="check" onClick={() => { setEditor(null); toast("Template saved", "emerald"); }}>Save template</Button>
+                <Button variant="primary" icon="check" disabled={saving} onClick={save}>{saving ? "Saving…" : "Save template"}</Button>
               </div>
             </div>
 
@@ -140,35 +227,24 @@ export function Templates({ toast }: { toast: (m: string, t?: string) => void })
               </div>
               <div className="flex-1 overflow-y-auto p-4">
                 <div className={`mx-auto rounded-xl border border-ink-600 bg-white/[0.03] transition-all ${device === "mobile" ? "max-w-[260px]" : ""}`}>
-                  <div className="flex items-center gap-2 border-b border-ink-700 px-3 py-2.5">
-                    <Avatar name="Alex Rivera" hue={255} size={24} />
-                    <div className="min-w-0">
-                      <p className="truncate text-[11px] font-medium text-white">Alex Rivera</p>
-                      <p className="truncate text-[10px] text-slate-500">to sarah.w@lumenstack.com</p>
-                    </div>
-                  </div>
-                  <div className="px-3 py-3">
-                    <p className="mb-2 text-[12px] font-semibold text-white">{(editor.subject || "(no subject)").replace(/\{\{first_name\}\}/g, "Sarah").replace(/\{\{company\}\}/g, "Lumenstack")}</p>
-                    <div className="text-[12px] leading-relaxed text-slate-400">
-                      {editor.body.split("\n").map((l, i) => <p key={i} className="min-h-[1em]">{l.replace(/\{\{first_name\}\}/g, "Sarah").replace(/\{\{company\}\}/g, "Lumenstack") || "\u00A0"}</p>)}
-                    </div>
-                  </div>
-                </div>
-                <div className="mt-4 space-y-3">
-                  <div>
-                    <p className="mb-1.5 text-[10.5px] uppercase tracking-wider text-slate-500">Used in campaigns</p>
-                    {campaigns.slice(0, 3).map((c) => (
-                      <div key={c.id} className="mb-1.5 flex items-center gap-2 rounded-lg border border-ink-700/70 px-2.5 py-2">
-                        <Icon name="send" className="h-3.5 w-3.5 text-brand-300" />
-                        <span className="truncate text-[11.5px] text-slate-300">{c.name}</span>
+                  {sender && (
+                    <div className="flex items-center gap-2 border-b border-ink-700 px-3 py-2.5">
+                      <Avatar name={sender.name} hue={(sender.email.charCodeAt(0) * 11) % 360} size={24} />
+                      <div className="min-w-0">
+                        <p className="truncate text-[11px] font-medium text-white">{sender.name}</p>
+                        <p className="truncate text-[10px] text-slate-500">&lt;{sender.email}&gt;</p>
                       </div>
-                    ))}
-                  </div>
-                  <div>
-                    <div className="mb-1 flex justify-between text-[11px]"><span className="text-slate-500">Reply rate</span><span className="font-semibold text-emerald-300">{editor.replyRate || 0}%</span></div>
-                    <Progress value={(editor.replyRate || 0) * 8} tone="emerald" />
+                    </div>
+                  )}
+                  <div className="px-3 py-3">
+                    <p className="mb-2 text-[12px] font-semibold text-white">{editor.subject || "(no subject)"}</p>
+                    {/* Merge tags render as typed: no sample lead exists, so nothing is substituted. */}
+                    <div className="text-[12px] leading-relaxed text-slate-400">
+                      {editor.body.split("\n").map((l, i) => <p key={i} className="min-h-[1em]">{l || "\u00A0"}</p>)}
+                    </div>
                   </div>
                 </div>
+                {/* "Used in campaigns" and reply-rate blocks: no API links templates to campaigns — hidden. */}
               </div>
             </div>
           </div>

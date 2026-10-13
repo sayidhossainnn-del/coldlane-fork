@@ -14,14 +14,15 @@ import { Icon } from "./components/ui";
 
 type Toast = { id: number; msg: string; tone: string };
 
+// Subtitles are deliberately count-free: live numbers come from the views themselves.
 const META: Record<NavKey, { title: string; subtitle: string; crumb: string[] }> = {
-  dashboard: { title: "Dashboard", subtitle: "Monday, Feb 23 · 4 campaigns sending today", crumb: ["Workspace", "Dashboard"] },
-  campaigns: { title: "Campaigns", subtitle: "5 campaigns · 9,840 leads · 41,720 emails sent", crumb: ["Workspace", "Campaigns"] },
-  leads: { title: "Leads", subtitle: "9,840 leads across 5 lists", crumb: ["Workspace", "Leads"] },
-  inbox: { title: "Unified Inbox", subtitle: "2 unread replies across 3 inboxes", crumb: ["Workspace", "Inbox"] },
+  dashboard: { title: "Dashboard", subtitle: "Workspace overview", crumb: ["Workspace", "Dashboard"] },
+  campaigns: { title: "Campaigns", subtitle: "Campaigns and sequences", crumb: ["Workspace", "Campaigns"] },
+  leads: { title: "Leads", subtitle: "Contacts across campaigns", crumb: ["Workspace", "Leads"] },
+  inbox: { title: "Unified Inbox", subtitle: "Replies across your inboxes", crumb: ["Workspace", "Inbox"] },
   analytics: { title: "Analytics", subtitle: "Account-wide performance and deliverability", crumb: ["Workspace", "Analytics"] },
-  accounts: { title: "Email Accounts", subtitle: "7 connected inboxes · 5 warming", crumb: ["Workspace", "Email Accounts"] },
-  templates: { title: "Templates", subtitle: "6 saved templates · avg. 10.5% reply rate", crumb: ["Workspace", "Templates"] },
+  accounts: { title: "Email Accounts", subtitle: "Connected sending inboxes", crumb: ["Workspace", "Email Accounts"] },
+  templates: { title: "Templates", subtitle: "Saved email templates", crumb: ["Workspace", "Templates"] },
   settings: { title: "Settings", subtitle: "Workspace configuration", crumb: ["Workspace", "Settings"] },
 };
 
@@ -99,9 +100,9 @@ export default function App() {
             {nav === "settings" && <Settings toast={toast} />}
 
             <footer className="mt-8 flex flex-wrap items-center justify-between gap-3 border-t border-ink-800 pt-5 text-[11px] text-slate-600">
-              <span>© 2026 Northwind Outbound · UI prototype · no data leaves this page</span>
+              <span>© 2026 Northwind Outbound</span>
               <span className="flex items-center gap-4">
-                <span className="flex items-center gap-1.5"><span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />All systems operational</span>
+                {/* "All systems operational": no health endpoint in the API — hidden. */}
                 <span className="flex items-center gap-1.5"><Icon name="command" className="h-3 w-3" />K to search</span>
               </span>
             </footer>

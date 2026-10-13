@@ -1,15 +1,15 @@
-import { Icon, Avatar, Badge } from "./ui";
-import { senders } from "../lib/data";
+import { Icon } from "./ui";
 
 export type NavKey =
   | "dashboard" | "campaigns" | "leads" | "inbox" | "analytics"
   | "accounts" | "templates" | "settings";
 
+// Counts are not hardcoded: badges would need live data from the API.
 export const NAV: { key: NavKey; label: string; icon: string; badge?: string }[] = [
   { key: "dashboard", label: "Dashboard", icon: "home" },
-  { key: "campaigns", label: "Campaigns", icon: "send", badge: "5" },
+  { key: "campaigns", label: "Campaigns", icon: "send" },
   { key: "leads", label: "Leads", icon: "users" },
-  { key: "inbox", label: "Unified Inbox", icon: "inbox", badge: "2" },
+  { key: "inbox", label: "Unified Inbox", icon: "inbox" },
   { key: "analytics", label: "Analytics", icon: "chart" },
   { key: "accounts", label: "Email Accounts", icon: "at" },
   { key: "templates", label: "Templates", icon: "template" },
@@ -80,43 +80,10 @@ export function Sidebar({
           );
         })}
 
-        {!collapsed && (
-          <>
-            <p className="px-2.5 pb-1.5 pt-5 text-[10px] font-semibold uppercase tracking-widest text-slate-600">Warmup</p>
-            <div className="mx-1 rounded-xl border border-ink-700/80 bg-gradient-to-b from-ink-850 to-ink-900 p-3">
-              <div className="flex items-center justify-between">
-                <span className="text-[11px] text-slate-400">Deliverability</span>
-                <span className="text-[11px] font-semibold text-emerald-400">94%</span>
-              </div>
-              <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white/[0.07]">
-                <div className="h-full w-[94%] rounded-full bg-gradient-to-r from-emerald-500 to-teal-400" />
-              </div>
-              <div className="mt-3 flex items-center gap-1.5">
-                <Icon name="flame" className="h-3.5 w-3.5 text-orange-400" />
-                <span className="text-[10px] text-slate-500">5 accounts warming</span>
-              </div>
-            </div>
-          </>
-        )}
+        {/* Warmup / deliverability widget: no API backs it — hidden. */}
       </nav>
 
-      {/* footer */}
-      <div className="border-t border-ink-700/70 p-2.5">
-        {!collapsed ? (
-          <div className="flex items-center gap-2.5 rounded-xl p-2 hover:bg-white/[0.04]">
-            <Avatar name="Alex Rivera" hue={255} size={32} />
-            <div className="min-w-0 flex-1">
-              <p className="truncate text-[12px] font-medium text-white">Alex Rivera</p>
-              <p className="truncate text-[10px] text-slate-500">Growth Lead · Pro</p>
-            </div>
-            <Icon name="chevronDown" className="h-3.5 w-3.5 text-slate-500" />
-          </div>
-        ) : (
-          <div className="grid place-items-center py-1">
-            <Avatar name="Alex Rivera" hue={255} size={32} />
-          </div>
-        )}
-      </div>
+      {/* User footer: there is no user/profile API — hidden. */}
     </aside>
   );
 }
@@ -168,18 +135,11 @@ export function Topbar({
         </button>
 
         <button className="relative rounded-lg p-2 text-slate-400 transition hover:bg-white/5 hover:text-white">
+          {/* Unread dot: no notifications API — hidden. */}
           <Icon name="bell" />
-          <span className="absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full bg-rose-400 ring-2 ring-ink-950" />
         </button>
 
-        <div className="hidden items-center -space-x-2 pl-1 sm:flex">
-          {senders.slice(0, 3).map((s) => (
-            <Avatar key={s.id} name={s.name} hue={s.hue} size={28} ring />
-          ))}
-          <span className="ml-3 hidden xl:block">
-            <Badge tone="emerald" dot>Live sending</Badge>
-          </span>
-        </div>
+        {/* Sender avatar stack and "Live sending" badge: no API in the shell — hidden. */}
 
         <button className="grid h-9 w-9 place-items-center rounded-lg bg-gradient-to-br from-brand-500 to-brand-700 text-white shadow-lg shadow-brand-900/40 transition hover:brightness-110">
           <Icon name="plus" className="h-4 w-4" />

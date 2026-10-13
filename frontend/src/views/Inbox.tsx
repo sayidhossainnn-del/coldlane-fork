@@ -161,12 +161,12 @@ export function Inbox({ toast }: { toast: (m: string, t?: string) => void }) {
 
       {/* conversation list */}
       <Card pad={false} className="flex flex-col overflow-hidden">
-        <div className="flex items-center justify-between gap-2 border-b border-ink-700 px-4 py-3">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-ink-700 px-4 py-3">
           <div className="min-w-0">
             <h3 className="text-[14px] font-semibold text-white">Replies</h3>
-            <p className="text-[11px] text-slate-500">{shown.length} conversations</p>
+            <p className="truncate text-[11px] text-slate-500">{shown.length} conversations</p>
           </div>
-          <Tabs tabs={["All", "Unread", "Pos", "Neg"]} active={folder} onChange={setFolder} />
+          <Tabs tabs={["All", "Unread", "Pos", "Neg"]} active={folder} onChange={setFolder} className="shrink-0" />
         </div>
         <div className="flex-1 overflow-y-auto">
           {loading && <p className="px-4 py-6 text-center text-[12px] text-slate-500">Loading replies…</p>}
