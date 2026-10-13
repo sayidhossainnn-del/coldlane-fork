@@ -1,28 +1,113 @@
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Avatar, Badge, Button, Icon, Card, Tabs } from "../components/ui";
-import { conversations as seed } from "../lib/data";
+import * as api from "../lib/api";
 import type { Conversation } from "../lib/data";
 
 const sentimentTone = { positive: "emerald", neutral: "slate", negative: "rose" } as const;
 
 export function Inbox({ toast }: { toast: (m: string, t?: string) => void }) {
-  const [list, setList] = useState(seed);
-  const [activeId, setActiveId] = useState(seed[0].id);
+  const [list, setList] = useState<Conversation[]>([]);
+  const [boxes, setBoxes] = useState<{ email: string; active: boolean }[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [activeId, setActiveId] = useState<string | null>(null);
   const [folder, setFolder] = useState("All");
   const [draft, setDraft] = useState("");
   const [query, setQuery] = useState("");
+  const [sending, setSending] = useState(false);
+  const [drafting, setDrafting] = useState(false);
 
-  const active = list.find((c) => c.id === activeId) ?? list[0];
+  const load = useCallback(() => {
+    setLoading(true);
+    setLoadError(null);
+    return api
+      .listThreads("all")
+      .then((rows) => {
+        setList(rows);
+        return rows;
+      })
+      .catch((err) => {
+        setLoadError(api.errorMessage(err));
+        return [] as Conversation[];
+      })
+      .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => {
+    load();
+    api.listMailboxes().then(setBoxes).catch(() => undefined);
+  }, [load]);
+
+  const active = list.find((c) => c.id === activeId);
   const shown = list.filter((c) => {
-    if (folder === "Unread") return c.unread;
-    if (folder === "Pos") return c.sentiment === "positive";
-    if (folder === "Neg") return c.sentiment === "negative";
-    return (c.from + c.subject).toLowerCase().includes(query.toLowerCase());
+    const f = folder.toLowerCase();
+    if (f === "unread" && !c.unread) return false;
+    if ((f === "pos" || f === "positive") && c.sentiment !== "positive") return false;
+    if ((f === "neg" || f === "negative") && c.sentiment !== "negative") return false;
+    const q = query.trim().toLowerCase();
+    return !q || (c.from + c.subject + c.preview + c.campaign).toLowerCase().includes(q);
   });
 
   const open = (c: Conversation) => {
     setActiveId(c.id);
-    setList((l) => l.map((x) => (x.id === c.id ? { ...x, unread: false } : x)));
+    setDraft("");
+    api
+      .getThread(c.id)
+      .then(({ lead, messages }) => {
+        const name = api.leadName(lead.fields, lead.email);
+        setList((l) =>
+          l.map((x) =>
+            x.id === c.id
+              ? {
+                  ...x,
+                  from: name,
+                  unread: false,
+                  subject: [...messages].reverse().find((m) => m.subject)?.subject ?? "",
+                  messages: messages.map((m) => ({
+                    id: String(m.id),
+                    author: m.direction === "out" ? "You" : name,
+                    me: m.direction === "out",
+                    body: m.body ?? "",
+                    time: api.formatTimestamp(m.received_at),
+                  })),
+                }
+              : x,
+          ),
+        );
+        api.markThreadRead(c.id).catch(() => undefined);
+      })
+      .catch((err) => toast(api.errorMessage(err), "rose"));
+  };
+
+  const sync = () => {
+    load().then((rows) => toast(`Inbox synced · ${rows.length} conversations`, "emerald"));
+  };
+
+  const aiDraft = () => {
+    if (!active || drafting) return;
+    setDrafting(true);
+    api
+      .draftReply(active.id)
+      .then(({ draft: d }) => {
+        setDraft(d);
+        toast("Draft ready. Review it, nothing was sent.", "emerald");
+      })
+      .catch((err) => toast(api.errorMessage(err), "rose"))
+      .finally(() => setDrafting(false));
+  };
+
+  const send = () => {
+    if (!active || !draft.trim() || sending) return;
+    setSending(true);
+    api
+      .sendReply(active.id, draft.trim())
+      .then(() => {
+        setDraft("");
+        toast("Reply sent", "emerald");
+        open(active);
+      })
+      .catch((err) => toast(api.errorMessage(err), "rose"))
+      .finally(() => setSending(false));
   };
 
   return (
@@ -62,15 +147,15 @@ export function Inbox({ toast }: { toast: (m: string, t?: string) => void }) {
         </div>
         <div className="border-t border-ink-700 px-2.5 py-2.5">
           <p className="px-2.5 pb-1.5 text-[10px] font-semibold uppercase tracking-widest text-slate-600">Connected inboxes</p>
-          {["alex@northwind.io", "sdr2@northwind.io", "maya@northwind.io"].map((m) => (
-            <button key={m} className="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[11.5px] text-slate-400 hover:bg-white/[0.04] hover:text-white">
-              <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-              <span className="truncate">{m}</span>
+          {boxes.map((m) => (
+            <button key={m.email} className="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[11.5px] text-slate-400 hover:bg-white/[0.04] hover:text-white">
+              <span className={`h-1.5 w-1.5 rounded-full ${m.active ? "bg-emerald-400" : "bg-slate-600"}`} />
+              <span className="truncate">{m.email}</span>
             </button>
           ))}
         </div>
         <div className="mt-auto border-t border-ink-700 p-3">
-          <Button variant="default" icon="refresh" size="sm" className="w-full" onClick={() => toast("Inbox synced · 2 new replies", "emerald")}>Sync now</Button>
+          <Button variant="default" icon="refresh" size="sm" className="w-full" onClick={sync}>Sync now</Button>
         </div>
       </Card>
 
@@ -84,6 +169,16 @@ export function Inbox({ toast }: { toast: (m: string, t?: string) => void }) {
           <Tabs tabs={["All", "Unread", "Pos", "Neg"]} active={folder} onChange={setFolder} />
         </div>
         <div className="flex-1 overflow-y-auto">
+          {loading && <p className="px-4 py-6 text-center text-[12px] text-slate-500">Loading replies…</p>}
+          {loadError && (
+            <div className="px-4 py-6 text-center text-[12px] text-slate-400">
+              <p>{loadError}</p>
+              <button onClick={load} className="mt-2 text-brand-300 hover:text-brand-200">Retry</button>
+            </div>
+          )}
+          {!loading && !loadError && shown.length === 0 && (
+            <p className="px-4 py-6 text-center text-[12px] text-slate-500">No replies match this filter.</p>
+          )}
           {shown.map((c) => (
             <button
               key={c.id}
@@ -98,7 +193,8 @@ export function Inbox({ toast }: { toast: (m: string, t?: string) => void }) {
                   <p className={`flex-1 truncate text-[13px] ${c.unread ? "font-semibold text-white" : "font-medium text-slate-300"}`}>{c.from}</p>
                   <span className="shrink-0 text-[10.5px] text-slate-500">{c.time}</span>
                 </div>
-                <p className="truncate text-[12px] text-slate-400">{c.subject}</p>
+                {/* TODO(feature): thread subject in list, GET /api/threads has no subject */}
+                <p className="truncate text-[12px] text-slate-400">{c.subject || c.email}</p>
                 <p className="mt-0.5 line-clamp-2 text-[11.5px] leading-snug text-slate-600">{c.preview}</p>
                 <div className="mt-1.5 flex items-center gap-1.5">
                   <Badge tone={sentimentTone[c.sentiment]}>{c.sentiment}</Badge>
@@ -117,7 +213,7 @@ export function Inbox({ toast }: { toast: (m: string, t?: string) => void }) {
           <>
             <div className="flex flex-wrap items-start justify-between gap-3 border-b border-ink-700 px-5 py-4">
               <div className="min-w-0">
-                <h3 className="truncate text-[15px] font-semibold tracking-tight text-white">{active.subject}</h3>
+                <h3 className="truncate text-[15px] font-semibold tracking-tight text-white">{active.subject || active.campaign}</h3>
                 <div className="mt-1 flex flex-wrap items-center gap-2 text-[11.5px] text-slate-500">
                   <Avatar name={active.from} hue={(active.email.charCodeAt(0) * 9) % 360} size={20} />
                   <span className="text-slate-300">{active.from}</span>
@@ -125,24 +221,19 @@ export function Inbox({ toast }: { toast: (m: string, t?: string) => void }) {
                   <Badge tone={sentimentTone[active.sentiment]}>{active.sentiment}</Badge>
                 </div>
               </div>
-              <div className="flex items-center gap-1.5">
-                <Button size="sm" variant="default" icon="clock" onClick={() => toast("Snoozed until tomorrow 9 AM", "sky")}>Snooze</Button>
-                <Button size="sm" variant="default" icon="archive" />
-                <Button size="sm" variant="default" icon="trash" />
-                <Button size="sm" variant="default" icon="more" />
-              </div>
+              {/* TODO(feature): snooze, archive, delete, more: no API */}
             </div>
 
             {/* lead context strip */}
             <div className="flex flex-wrap items-center gap-x-5 gap-y-1.5 border-b border-ink-700 bg-ink-850/40 px-5 py-2.5 text-[11.5px]">
               <span className="text-slate-500">Campaign: <b className="text-slate-300">{active.campaign}</b></span>
-              <span className="text-slate-500">Step: <b className="text-slate-300">3 of 7</b></span>
-              <span className="text-slate-500">Opens: <b className="text-slate-300">6</b></span>
-              <span className="text-slate-500">Clicks: <b className="text-slate-300">2</b></span>
-              <button className="ml-auto flex items-center gap-1 text-brand-300 hover:text-brand-200">View full profile <Icon name="chevronRight" className="h-3 w-3" /></button>
+              {/* TODO(feature): step, opens, clicks, view full profile: not in thread API */}
             </div>
 
             <div className="flex-1 space-y-4 overflow-y-auto p-5">
+              {active.messages.length === 0 && (
+                <p className="text-center text-[12px] text-slate-500">Loading conversation…</p>
+              )}
               {active.messages.map((m) => (
                 <div key={m.id} className={`flex gap-3 ${m.me ? "flex-row-reverse" : ""}`}>
                   <Avatar name={m.author} hue={m.me ? 255 : (active.email.charCodeAt(0) * 9) % 360} size={30} />
@@ -163,8 +254,8 @@ export function Inbox({ toast }: { toast: (m: string, t?: string) => void }) {
             {active.sentiment === "positive" && (
               <div className="mx-5 mb-3 flex flex-wrap items-center gap-2 rounded-xl border border-emerald-500/25 bg-emerald-500/[0.07] px-3.5 py-2.5">
                 <Icon name="sparkles" className="h-4 w-4 text-emerald-300" />
-                <p className="flex-1 text-[11.5px] text-emerald-200">Positive intent detected. Suggested reply ready and meeting slots prepared.</p>
-                <Button size="sm" variant="success" icon="zap" onClick={() => setDraft("Thursday 2pm ET works great. Here's my calendar link — I'll bring the teardown for Lumenstack specifically.\n\nAlex")}>Use AI reply</Button>
+                <p className="flex-1 text-[11.5px] text-emerald-200">Positive intent detected. Generate a reply draft.</p>
+                <Button size="sm" variant="success" icon="zap" onClick={aiDraft}>{drafting ? "Drafting…" : "Use AI reply"}</Button>
               </div>
             )}
 
@@ -178,15 +269,10 @@ export function Inbox({ toast }: { toast: (m: string, t?: string) => void }) {
                   className="w-full resize-none bg-transparent p-3.5 text-[13px] text-slate-200 placeholder:text-slate-600 outline-none"
                 />
                 <div className="flex flex-wrap items-center gap-1.5 border-t border-ink-700 px-3 py-2">
-                  {["bold", "italic", "link", "image", "paperclip"].map((t) => (
-                    <button key={t} className="grid h-7 w-7 place-items-center rounded-md text-slate-500 hover:bg-white/[0.07] hover:text-white"><Icon name={t} className="h-3.5 w-3.5" /></button>
-                  ))}
-                  <select className="ml-1 rounded-md border border-ink-700 bg-ink-900 px-2 py-1 text-[11.5px] text-slate-400 outline-none">
-                    {["alex@northwind.io", "sdr2@northwind.io"].map((m) => <option key={m}>{m}</option>)}
-                  </select>
+                  {/* TODO(feature): rich-text tools, attachments, sender picker: API sends plain text from the lead's mailbox */}
                   <div className="ml-auto flex items-center gap-2">
-                    <Button size="sm" variant="ghost" icon="sparkles" onClick={() => toast("AI is drafting…", "violet")}>AI assist</Button>
-                    <Button size="sm" variant="primary" icon="send" onClick={() => { setDraft(""); toast("Reply sent · sequence stopped for this lead", "emerald") }}>Send</Button>
+                    <Button size="sm" variant="ghost" icon="sparkles" onClick={aiDraft}>{drafting ? "Drafting…" : "AI assist"}</Button>
+                    <Button size="sm" variant="primary" icon="send" onClick={send}>{sending ? "Sending…" : "Send"}</Button>
                   </div>
                 </div>
               </div>
