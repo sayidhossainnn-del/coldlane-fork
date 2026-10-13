@@ -18,6 +18,7 @@ No signup. No per-seat or per-mailbox fees. Docker Compose and a SQLite file. Ab
 - [Try it offline first (test profile + GreenMail)](#try-it-offline-first-test-profile--greenmail)
 - [Production mailboxes](#production-mailboxes)
 - [How sending works](#how-sending-works)
+- [JSON API](#json-api)
 - [Environment variables](#environment-variables)
 - [Compliance](#compliance)
 - [Operations, tests and limitations](#operations-tests-and-limitations)
@@ -184,6 +185,62 @@ Passwords are encrypted at rest with Fernet (`ENCRYPTION_KEY`) and never shown a
 - **Settings vs .env:** a business name or address saved in Settings overrides `.env`. A field saved **blank** in Settings counts as empty (it does not fall back to `.env`), so campaigns can't start. **Use .env values** removes the overrides. A per-mailbox address override beats both.
 - **Rates on the dashboard:** reply rate = replied ÷ leads contacted; bounce rate = bounced ÷ emails that went out.
 
+## JSON API
+
+An optional JSON API for an external frontend lives under `/api`. It is **disabled (404) until you set `API_KEY`**; every request then needs the header `X-API-Key: <API_KEY>` (missing or wrong → **401**). Set `API_CORS_ORIGIN` to let a browser app call it (CORS headers are added by hand, including `OPTIONS` preflight). The API never returns mailbox passwords or the encrypted `smtp_pass_enc` / `imap_pass_enc` columns.
+
+The API exposes the unibox, templates, mailboxes, campaigns, leads and stats. It cannot send email and it never bypasses the web UI's rules: starting a campaign runs the same validation (active mailbox, steps, queued leads, sender postal address, `PUBLIC_BASE_URL`) and the same suppression sweep, so the footer, one-click unsubscribe, lawful-basis and stop-on-reply/bounce/opt-out behaviour are unchanged. Bulk CSV import and its lawful-basis confirmation stay in the UI.
+
+```bash
+# Threads (filter=all|replied|unread)
+curl -H "X-API-Key: $API_KEY" 'http://127.0.0.1:8080/api/threads?filter=unread&limit=20&offset=0'
+# One thread (oldest message first)
+curl -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/threads/1
+# Mark a thread read
+curl -X POST -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/threads/1/read
+# Reply in the thread (plain text + the mandatory footer, unsubscribe headers and link)
+curl -X POST -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
+  -d '{"body":"Sure, Tuesday 10am works. Talk then."}' http://127.0.0.1:8080/api/threads/1/reply
+# ... or force a specific mailbox
+curl -X POST -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
+  -d '{"body":"Bumping this.","mailbox_id":2}' http://127.0.0.1:8080/api/threads/1/reply
+
+# Templates
+curl -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/templates
+curl -X POST -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
+  -d '{"name":"Follow-up 1","subject":"Re: {{company}}","body":"Hi {{first_name|there}},"}' \
+  http://127.0.0.1:8080/api/templates
+curl -X PUT -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
+  -d '{"name":"Follow-up 1","body":"Bumping this."}' http://127.0.0.1:8080/api/templates/1
+curl -X DELETE -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/templates/1
+
+# Mailboxes (passwords are write-only)
+curl -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/mailboxes
+curl -X POST -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
+  -d '{"from_email":"a@agency.test","smtp_host":"smtp.gmail.com","smtp_user":"a@agency.test","smtp_password":"app-password","smtp_security":"starttls","daily_cap":30}' \
+  http://127.0.0.1:8080/api/mailboxes
+curl -X PUT -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
+  -d '{"label":"A","daily_cap":20}' http://127.0.0.1:8080/api/mailboxes/1
+curl -X POST -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/mailboxes/1/test
+curl -X POST -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/mailboxes/1/pause
+curl -X POST -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/mailboxes/1/resume
+
+# Campaigns
+curl -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/campaigns
+curl -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/campaigns/1
+curl -X POST -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/campaigns/1/start
+curl -X POST -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/campaigns/1/pause
+
+# Leads (campaign_id, status, limit, offset)
+curl -H "X-API-Key: $API_KEY" 'http://127.0.0.1:8080/api/leads?campaign_id=1&status=replied'
+# Stats (sent/replied/bounced/unsubscribed per campaign and total)
+curl -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/stats
+```
+
+`POST /api/threads/{lead_id}/reply` sends a manual reply from the mailbox that emailed the lead (or an explicit `mailbox_id`), plain text with `Re: <subject>`, `In-Reply-To`/`References` set to the newest message in the thread, and the same mandatory footer, `List-Unsubscribe` headers and unsubscribe link as campaign emails. It is **not a campaign step**: the lead's `current_step` and `status` are not touched and the sequence is never restarted. It is logged in `sends.csv` with `step_pos = 0`, so it counts against the mailbox's daily cap (over the cap → **429**). A suppressed, unsubscribed or bounced lead is refused with **409**; a paused/inactive mailbox with **400**; an SMTP failure with **502** (a hard bounce suppresses the address, like the worker does).
+
+The web UI keeps working exactly as before; `/api/*` only skips the session login because it authenticates with the API key instead.
+
 ## Environment variables
 
 | Variable | Default | Purpose |
@@ -202,6 +259,8 @@ Passwords are encrypted at rest with Fernet (`ENCRYPTION_KEY`) and never shown a
 | `MAX_BOUNCE_RATE` | 0.05 | Campaign auto-pause |
 | `WORKER_TICK_SECONDS` | 30 | Send loop |
 | `IMAP_POLL_SECONDS` | 300 | Reply/bounce poll |
+| `API_KEY` | (none) | Shared secret for the JSON API (`X-API-Key`). **Unset = `/api` disabled (404)** |
+| `API_CORS_ORIGIN` | (none) | Browser origin allowed to call `/api` (CORS). Unset = no CORS headers |
 | `GREENMAIL_HOST` / `GREENMAIL_SMTP_PORT` / `GREENMAIL_IMAP_PORT` | greenmail / 3025 / 3143 | Test-profile helper scripts only |
 
 ## Compliance

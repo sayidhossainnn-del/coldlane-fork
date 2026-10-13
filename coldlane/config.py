@@ -69,3 +69,13 @@ def tick_seconds():
 
 def imap_poll_seconds():
     return max(1, env_int("IMAP_POLL_SECONDS", 300))
+
+
+def api_key():
+    """Shared secret for the JSON API. When unset, /api is disabled (404)."""
+    return env("API_KEY")
+
+
+def api_cors_origin():
+    """Browser origin allowed to call /api (sent as Access-Control-Allow-Origin)."""
+    return env("API_CORS_ORIGIN")

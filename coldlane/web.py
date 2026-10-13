@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from flask import (Flask, Response, abort, flash, g, jsonify, redirect, render_template,
                    request, session, url_for)
 
-from . import config, core, crypto, db, mailer
+from . import api, config, core, crypto, db, mailer
 
 PUBLIC_ENDPOINTS = {"health", "login", "static", "unsubscribe", "unsubscribe_undo"}
 DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -57,6 +57,7 @@ def create_app():
     app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
     db.init_db()
     crypto.get_key()  # fail fast on an invalid ENCRYPTION_KEY
+    app.register_blueprint(api.bp)
 
     @app.teardown_appcontext
     def close_db(exc):  # noqa: ARG001
@@ -68,6 +69,8 @@ def create_app():
     def require_login():
         if request.endpoint in PUBLIC_ENDPOINTS:
             return None
+        if request.path == "/api" or request.path.startswith("/api/"):
+            return None  # /api/* authenticates with X-API-Key (see coldlane/api.py)
         if not session.get("owner"):
             return redirect(url_for("login", next=request.path))
         return None
