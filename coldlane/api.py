@@ -12,10 +12,18 @@ passwords and their encrypted form (``smtp_pass_enc`` / ``imap_pass_enc``) are
 never serialized: each mailbox payload is built from a column whitelist.
 
 The API cannot send email; the worker does that, so the send-time suppression,
-cap, throttle, footer and lawful-basis rules are unchanged by this layer.
+cap, throttle, footer and lawful-basis rules are unchanged by this layer. Campaign
+creation and lead import reuse the web UI's rules: the parts that live in
+``core``/``db`` are called directly, and the validation/storage that is trapped
+inside ``create_app`` closures is mirrored line-for-line with a comment pointing
+at the original (``web.py`` is deliberately not refactored).
 """
+import csv
 import hmac
+import io
 import json
+import secrets
+from zoneinfo import ZoneInfo
 
 from flask import Blueprint, g, jsonify, make_response, request
 
@@ -27,6 +35,13 @@ CORS_METHODS = "GET, POST, PUT, DELETE, OPTIONS"
 CORS_HEADERS = "Content-Type, X-API-Key"
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 200
+
+# Mirrors web.py's MAX_STEPS / UNIT_MINUTES (module-level constants there).
+MAX_STEPS = 5
+UNIT_MINUTES = {"minutes": 1, "hours": 60, "days": 1440}
+LAWFUL_BASIS_MESSAGE = ("Import rejected: tick the lawful-basis confirmation (\"I confirm I have a lawful basis "
+                        "to email these contacts and will honor opt-outs.\").")
+REJECTED_LIMIT = 20
 
 # Whitelists (never blocklists) so a password or encrypted secret can never leak
 # even if the schema grows later.
@@ -500,6 +515,169 @@ def mailbox_resume(mailbox_id):
 
 
 # ---------------------------------------------------------------- campaigns
+def _campaign_detail(conn, campaign):
+    return {
+        "campaign": dict(campaign),
+        "steps": [dict(row) for row in core.campaign_steps(conn, campaign["id"])],
+        "mailboxes": [_mailbox_public(conn, row) for row in core.campaign_mailboxes(conn, campaign["id"])],
+        "stats": core.campaign_stats(conn, campaign["id"]),
+        "start_errors": (core.validate_start(conn, campaign["id"])
+                         if campaign["status"] in ("draft", "completed") else []),
+    }
+
+
+def _sent_step_ids(conn, campaign_id):
+    """Steps that already went out to at least one lead: never rewritten or deleted again."""
+    return {row["step_id"] for row in conn.execute(
+        "SELECT DISTINCT step_id FROM sends WHERE campaign_id=? AND step_id IS NOT NULL", (campaign_id,))}
+
+
+def _campaign_schedule(data):
+    """Mirror of the schedule half of web._campaign_form (a closure in create_app)."""
+    errors = []
+    fields = {
+        "name": str(data.get("name") or "").strip() or "Untitled campaign",
+        "timezone": str(data.get("timezone") or "UTC").strip(),
+    }
+    try:
+        ZoneInfo(fields["timezone"])
+    except Exception:  # noqa: BLE001
+        errors.append(f"Unknown timezone '{fields['timezone']}'. Use an IANA name like America/New_York or UTC.")
+    raw_days = data.get("days")
+    raw_days = raw_days if isinstance(raw_days, (list, tuple)) else []
+    days = sorted({int(d) for d in raw_days if str(d).strip().isdigit() and 0 <= int(d) <= 6})
+    if not days:
+        errors.append("Pick at least one send day.")
+    fields["window_days"] = ",".join(str(d) for d in days)
+    try:
+        start = int(str(data["window_start"]).strip()) if "window_start" in data else 9
+        end = int(str(data["window_end"]).strip()) if "window_end" in data else 17
+    except (KeyError, TypeError, ValueError):
+        start, end = 9, 17
+        errors.append("Window hours must be numbers.")
+    if not (0 <= start < end <= 24):
+        errors.append("Send window must satisfy 0 <= start hour < end hour <= 24.")
+    fields["window_start_hour"], fields["window_end_hour"] = start, end
+    return fields, errors
+
+
+def _campaign_steps(raw_steps):
+    """Mirror of the steps half of web._campaign_form.
+
+    The web form uses fixed slots 1..MAX_STEPS; here the list order defines the
+    position, empty entries are ignored and the positions stay contiguous.
+    """
+    errors = []
+    steps = []
+    if raw_steps is None:
+        return steps, errors
+    if not isinstance(raw_steps, (list, tuple)):
+        return [], ["steps must be a list."]
+    if len(raw_steps) > MAX_STEPS:
+        return [], [f"A campaign can have at most {MAX_STEPS} steps."]
+    for index, entry in enumerate(raw_steps):
+        slot = index + 1
+        if not isinstance(entry, dict):
+            errors.append(f"Step {slot} must be an object with subject/body.")
+            continue
+        subject = str(entry.get("subject") or "").strip()
+        body = str(entry.get("body") or "").replace("\r\n", "\n").strip()
+        if not subject and not body:
+            continue
+        if not body:
+            errors.append(f"Step {slot} needs a body.")
+        if entry.get("delay_minutes") is not None:
+            raw_delay = entry["delay_minutes"]
+        elif entry.get("delay_days") is not None:
+            try:
+                raw_delay = int(str(entry["delay_days"]).strip()) * UNIT_MINUTES["days"]
+            except (TypeError, ValueError):
+                errors.append(f"Step {slot} delay_days must be a number.")
+                raw_delay = None
+        else:
+            raw_delay = 0
+        try:
+            minutes = max(0, int(str(raw_delay).strip())) if raw_delay is not None else 0
+        except (TypeError, ValueError):
+            errors.append(f"Step {slot} delay must be a number.")
+            minutes = 0
+        steps.append({"position": len(steps) + 1, "subject": subject, "body": body, "delay_minutes": minutes})
+    positions = [step["position"] for step in steps]
+    if positions and positions != list(range(1, len(positions) + 1)):
+        errors.append("Steps must be filled in order without gaps (step 1, 2, 3...).")
+    if steps:
+        steps[0]["delay_minutes"] = 0
+        if not steps[0]["subject"]:
+            errors.append("Step 1 needs a subject.")
+    for step in steps:
+        for text in (step["subject"], step["body"]):
+            if text.count("{{") != text.count("}}"):
+                errors.append(f"Step {step['position']} has unbalanced {{{{ }}}} merge braces.")
+    return steps, errors
+
+
+def _campaign_mailbox_ids(conn, data):
+    """Mailbox ids that must exist.
+
+    The web form inserts with INSERT OR IGNORE and so never notices a bad id;
+    this explicit existence check is the one place the API is stricter on purpose.
+    """
+    raw = data.get("mailbox_ids")
+    if raw is None:
+        return [], []
+    if not isinstance(raw, (list, tuple)):
+        return [], ["mailbox_ids must be a list of mailbox ids."]
+    ids, errors = [], []
+    for value in raw:
+        if isinstance(value, bool) or not str(value).strip().isdigit():
+            errors.append(f"mailbox_ids must contain integers, got {value!r}.")
+            continue
+        mailbox_id = int(str(value).strip())
+        if conn.execute("SELECT 1 FROM mailboxes WHERE id=?", (mailbox_id,)).fetchone() is None:
+            errors.append(f"Mailbox {mailbox_id} does not exist.")
+            continue
+        ids.append(mailbox_id)
+    return ids, errors
+
+
+def _write_campaign(conn, campaign_id, fields, mailbox_ids=None, steps=None):
+    """Mirror of web._save_campaign, plus step locking.
+
+    ``None`` leaves that part untouched (PUT uses it so a partial edit cannot wipe
+    steps or mailbox assignments). Steps that already appear in ``sends`` are never
+    rewritten or deleted; their positions are returned so the caller can report them.
+    """
+    sent_ids = _sent_step_ids(conn, campaign_id)
+    sets = ",".join(f"{key}=?" for key in fields)
+    conn.execute(f"UPDATE campaigns SET {sets} WHERE id=?", (*fields.values(), campaign_id))
+    if mailbox_ids is not None:
+        conn.execute("DELETE FROM campaign_mailboxes WHERE campaign_id=?", (campaign_id,))
+        for mailbox_id in mailbox_ids:
+            conn.execute("INSERT OR IGNORE INTO campaign_mailboxes(campaign_id, mailbox_id) VALUES(?,?)",
+                         (campaign_id, mailbox_id))
+    locked = []
+    if steps is not None:
+        existing = {step["position"]: step for step in core.campaign_steps(conn, campaign_id)}
+        for step in steps:
+            current = existing.get(step["position"])
+            if current is not None and current["id"] in sent_ids:
+                locked.append(step["position"])
+                continue
+            if current is not None:
+                conn.execute("UPDATE steps SET subject=?, body=?, delay_minutes=? WHERE id=?",
+                             (step["subject"], step["body"], step["delay_minutes"], current["id"]))
+            else:
+                conn.execute("INSERT INTO steps(campaign_id, position, subject, body, delay_minutes) "
+                             "VALUES(?,?,?,?,?)",
+                             (campaign_id, step["position"], step["subject"], step["body"],
+                              step["delay_minutes"]))
+        keep = {step["position"] for step in steps}
+        for position, row in existing.items():
+            if position not in keep and row["id"] not in sent_ids:
+                conn.execute("DELETE FROM steps WHERE id=?", (row["id"],))
+    return locked
+
+
 @bp.get("/campaigns")
 def campaigns_list():
     conn = _conn()
@@ -514,13 +692,183 @@ def campaign_detail(campaign_id):
     campaign = conn.execute("SELECT * FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
     if campaign is None:
         return _error("Campaign not found.", 404)
-    return jsonify({
-        "campaign": dict(campaign),
-        "steps": [dict(row) for row in core.campaign_steps(conn, campaign_id)],
-        "mailboxes": [_mailbox_public(conn, row) for row in core.campaign_mailboxes(conn, campaign_id)],
-        "stats": core.campaign_stats(conn, campaign_id),
-        "start_errors": core.validate_start(conn, campaign_id) if campaign["status"] in ("draft", "completed") else [],
-    })
+    return jsonify(_campaign_detail(conn, campaign))
+
+
+@bp.post("/campaigns")
+def campaign_create():
+    """Create a draft campaign. Mirrors web.campaign_new + web._campaign_form/_save_campaign."""
+    data = _payload()
+    if data is None:
+        return _error("Request body must be a JSON object.", 400)
+    conn = _conn()
+    fields, errors = _campaign_schedule(data)
+    steps, step_errors = _campaign_steps(data.get("steps"))
+    mailbox_ids, mailbox_errors = _campaign_mailbox_ids(conn, data)
+    errors += step_errors + mailbox_errors
+    if errors:
+        return _error("Campaign validation failed.", 400, details=errors)
+    cur = conn.execute("INSERT INTO campaigns(name, created_at) VALUES(?, ?)",
+                       (fields["name"], core.ts(core.utcnow())))
+    campaign_id = cur.lastrowid
+    _write_campaign(conn, campaign_id, fields, mailbox_ids, steps)
+    campaign = conn.execute("SELECT * FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
+    return jsonify(_campaign_detail(conn, campaign)), 201
+
+
+@bp.put("/campaigns/<int:campaign_id>")
+def campaign_update(campaign_id):
+    """Edit a draft or paused campaign. Omitted keys keep their stored value."""
+    conn = _conn()
+    campaign = conn.execute("SELECT * FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
+    if campaign is None:
+        return _error("Campaign not found.", 404)
+    if campaign["status"] not in ("draft", "paused"):
+        return _error(f"Cannot edit a campaign with status '{campaign['status']}': only draft and paused "
+                      "campaigns are editable.", 409)
+    data = _payload()
+    if data is None:
+        return _error("Request body must be a JSON object.", 400)
+    merged = {
+        "name": data["name"] if "name" in data else campaign["name"],
+        "timezone": data["timezone"] if "timezone" in data else campaign["timezone"],
+        "days": (data["days"] if "days" in data
+                 else [d for d in (campaign["window_days"] or "").split(",") if d.strip()]),
+        "window_start": data["window_start"] if "window_start" in data else campaign["window_start_hour"],
+        "window_end": data["window_end"] if "window_end" in data else campaign["window_end_hour"],
+    }
+    fields, errors = _campaign_schedule(merged)
+    steps = None
+    if "steps" in data:
+        steps, step_errors = _campaign_steps(data["steps"])
+        errors += step_errors
+    mailbox_ids = None
+    if "mailbox_ids" in data:
+        mailbox_ids, mailbox_errors = _campaign_mailbox_ids(conn, data)
+        errors += mailbox_errors
+    if errors:
+        return _error("Campaign validation failed.", 400, details=errors)
+    locked = _write_campaign(conn, campaign_id, fields, mailbox_ids, steps)
+    campaign = conn.execute("SELECT * FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
+    payload = _campaign_detail(conn, campaign)
+    payload["locked_steps"] = locked
+    return jsonify(payload)
+
+
+@bp.delete("/campaigns/<int:campaign_id>")
+def campaign_delete(campaign_id):
+    """Delete a draft and everything that belongs to it. Non-drafts are refused."""
+    conn = _conn()
+    campaign = conn.execute("SELECT * FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
+    if campaign is None:
+        return _error("Campaign not found.", 404)
+    if campaign["status"] != "draft":
+        return _error(f"Cannot delete a campaign with status '{campaign['status']}': only drafts can be deleted.",
+                      409)
+    lead_ids = [row["id"] for row in conn.execute("SELECT id FROM leads WHERE campaign_id=?", (campaign_id,))]
+    marks = ",".join("?" for _ in lead_ids) or "NULL"
+    deleted = {}
+    for table, where, args in (
+            ("messages", f"campaign_id=? OR lead_id IN ({marks})", (campaign_id, *lead_ids)),
+            ("events", f"campaign_id=? OR lead_id IN ({marks})", (campaign_id, *lead_ids)),
+            ("sends", "campaign_id=?", (campaign_id,)),
+            ("leads", "campaign_id=?", (campaign_id,)),
+            ("imports", "campaign_id=?", (campaign_id,)),
+            ("steps", "campaign_id=?", (campaign_id,)),
+            ("campaign_mailboxes", "campaign_id=?", (campaign_id,))):
+        deleted[table] = conn.execute(f"DELETE FROM {table} WHERE {where}", args).rowcount
+    conn.execute("DELETE FROM campaigns WHERE id=?", (campaign_id,))
+    return jsonify({"deleted": campaign_id, "campaign_name": campaign["name"],
+                    "leads_deleted": deleted["leads"], "steps_deleted": deleted["steps"],
+                    "imports_deleted": deleted["imports"], "messages_deleted": deleted["messages"]})
+
+
+@bp.get("/campaigns/<int:campaign_id>/steps")
+def campaign_steps_list(campaign_id):
+    conn = _conn()
+    if conn.execute("SELECT 1 FROM campaigns WHERE id=?", (campaign_id,)).fetchone() is None:
+        return _error("Campaign not found.", 404)
+    sent_ids = _sent_step_ids(conn, campaign_id)
+    return jsonify({"campaign_id": campaign_id, "steps": [
+        {**dict(row), "locked": row["id"] in sent_ids} for row in core.campaign_steps(conn, campaign_id)]})
+
+
+@bp.get("/campaigns/<int:campaign_id>/fields")
+def campaign_fields(campaign_id):
+    """Merge fields available from this campaign's imported leads (for the editor)."""
+    conn = _conn()
+    if conn.execute("SELECT 1 FROM campaigns WHERE id=?", (campaign_id,)).fetchone() is None:
+        return _error("Campaign not found.", 404)
+    names = set()
+    for row in conn.execute("SELECT fields_json FROM leads WHERE campaign_id=?", (campaign_id,)):
+        try:
+            names.update(json.loads(row["fields_json"] or "{}").keys())
+        except (ValueError, TypeError):
+            continue
+    names.discard("email")
+    return jsonify({"campaign_id": campaign_id, "fields": ["email", *sorted(names)]})
+
+
+@bp.post("/campaigns/<int:campaign_id>/preview")
+def campaign_preview(campaign_id):
+    """Render one lead's next (or a chosen) step with the worker's own renderer."""
+    conn = _conn()
+    campaign = conn.execute("SELECT * FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
+    if campaign is None:
+        return _error("Campaign not found.", 404)
+    data = _payload()
+    if data is None:
+        return _error("Request body must be a JSON object.", 400)
+    raw_lead = data.get("lead_id")
+    if isinstance(raw_lead, bool) or not str(raw_lead).strip().isdigit():
+        return _error("lead_id is required and must be an integer.", 400)
+    lead = conn.execute("SELECT * FROM leads WHERE id=? AND campaign_id=?",
+                        (int(str(raw_lead).strip()), campaign_id)).fetchone()
+    if lead is None:
+        return _error("Lead not found in this campaign.", 404)
+    steps = core.campaign_steps(conn, campaign_id)
+    if not steps:
+        return _error("Campaign has no steps to preview.", 400)
+    by_position = {step["position"]: step for step in steps}
+    if data.get("step") is not None:
+        raw_step = data["step"]
+        if isinstance(raw_step, bool) or not str(raw_step).strip().isdigit():
+            return _error("step must be an integer position.", 400)
+        position = int(str(raw_step).strip())
+        step = by_position.get(position)
+        if step is None:
+            return _error("Step not found in this campaign.", 404)
+    else:
+        # The worker sends steps[current_step] next, so preview that one (clamped to the last step).
+        position = min((lead["current_step"] or 0) + 1, steps[-1]["position"])
+        step = by_position[position]
+    fields = json.loads(lead["fields_json"] or "{}")
+    fields.setdefault("email", lead["email"])
+    result = {"campaign_id": campaign_id, "lead_id": lead["id"], "email": lead["email"],
+              "position": position, "fields": fields, "merge_error": None}
+    try:
+        body = mailer.render(step["body"], fields)
+        if (step["subject"] or "").strip():
+            subject = mailer.render(step["subject"], fields)
+        else:
+            base = lead["thread_subject"] or mailer.render(steps[0]["subject"], fields)
+            subject = base if base.lower().startswith("re:") else f"Re: {base}"
+    except mailer.MergeError as exc:
+        result["merge_error"] = str(exc)
+        result["subject"] = result["body"] = result["text"] = None
+        return jsonify(result)
+    result["subject"], result["body"] = subject, body
+    # Same footer assembly as web.campaign_preview (first assigned mailbox, or a placeholder).
+    mailboxes = core.campaign_mailboxes(conn, campaign_id)
+    if mailboxes:
+        business, address = core.resolve_sender(conn, mailboxes[0])
+        url = f"{config.public_base_url() or '{PUBLIC_BASE_URL}'}/u/{lead['unsub_token']}"
+        signature = mailboxes[0]["signature"]
+        text = body + (("\n\n" + signature.strip()) if signature and signature.strip() else "")
+        result["text"] = text + "\n\n--\n" + mailer.footer_text(business, address or "(SENDER ADDRESS MISSING)", url)
+    else:
+        result["text"] = body + "\n\n--\n(footer added at send: business name, postal address, unsubscribe link)"
+    return jsonify(result)
 
 
 @bp.post("/campaigns/<int:campaign_id>/start")
@@ -547,6 +895,95 @@ def campaign_pause(campaign_id):
                  "WHERE id=? AND status='active'", (campaign_id,))
     row = conn.execute("SELECT * FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
     return jsonify({"id": row["id"], "status": row["status"], "paused_reason": row["paused_reason"]})
+
+
+@bp.post("/campaigns/<int:campaign_id>/leads/import")
+def campaign_leads_import(campaign_id):
+    """Import leads, mirroring web.campaign_import (a closure in create_app).
+
+    Accepts a multipart CSV upload (like the web form) or JSON
+    {filename, lawful_basis_confirmed, csv_text}. The lawful-basis acknowledgement is
+    stored in `imports` exactly as the web route stores it: who, when, filename.
+    """
+    conn = _conn()
+    if conn.execute("SELECT 1 FROM campaigns WHERE id=?", (campaign_id,)).fetchone() is None:
+        return _error("Campaign not found.", 404)
+
+    if request.mimetype == "multipart/form-data":
+        if not _as_bool(request.form.get("lawful_basis_confirmed") or request.form.get("lawful_basis"), 0):
+            return _error(LAWFUL_BASIS_MESSAGE, 400)
+        upload = request.files.get("file")
+        if upload is None or not upload.filename:
+            return _error("Choose a CSV file to import.", 400)
+        from .web import _read_upload  # web.py's own CSV decoder (lazy: web imports api at load)
+        csv_text = _read_upload(upload)
+        filename = upload.filename
+        acknowledged_by = (request.form.get("acknowledged_by") or "owner").strip()[:200]
+    else:
+        data = _payload()
+        if data is None:
+            return _error("Request body must be a JSON object.", 400)
+        if _as_bool(data.get("lawful_basis_confirmed"), 0) != 1:
+            return _error(LAWFUL_BASIS_MESSAGE, 400)
+        csv_text = data.get("csv_text")
+        if not isinstance(csv_text, str) or not csv_text.strip():
+            return _error("csv_text is required.", 400)
+        filename = str(data.get("filename") or "api-import.csv").strip() or "api-import.csv"
+        acknowledged_by = str(data.get("acknowledged_by") or "owner").strip()[:200]
+
+    reader = csv.DictReader(io.StringIO(csv_text))
+    if not reader.fieldnames or "email" not in [core.norm_key(f) for f in reader.fieldnames]:
+        return _error("Import rejected: the CSV needs an 'email' column.", 400)
+
+    now = core.ts(core.utcnow())
+    cur = conn.execute("INSERT INTO imports(campaign_id, filename, acknowledged_at, acknowledged_by) "
+                       "VALUES(?,?,?,?)", (campaign_id, filename[:255], now, acknowledged_by))
+    import_id = cur.lastrowid
+    existing = {row["email"] for row in conn.execute("SELECT email FROM leads WHERE campaign_id=?",
+                                                      (campaign_id,))}
+    counts = {"rows": 0, "imported": 0, "suppressed": 0, "invalid": 0, "duplicates": 0}
+    rejected, rejected_total = [], [0]
+
+    def reject(row_no, address, reason):
+        rejected_total[0] += 1
+        if len(rejected) < REJECTED_LIMIT:
+            rejected.append({"row": row_no, "email": address, "reason": reason})
+
+    for row in reader:
+        counts["rows"] += 1
+        # Every column except `email` is kept as a merge field, exactly like the web import.
+        fields = {core.norm_key(key): (value or "").strip() for key, value in row.items() if key}
+        email_addr = fields.pop("email", "").strip().lower()
+        if not core.valid_email(email_addr):
+            counts["invalid"] += 1
+            reject(counts["rows"], email_addr, "invalid email")
+            continue
+        if email_addr in existing:
+            counts["duplicates"] += 1
+            reject(counts["rows"], email_addr, "duplicate")
+            continue
+        existing.add(email_addr)
+        status = "suppressed" if core.is_suppressed(conn, email_addr) else "queued"
+        cur = conn.execute(
+            "INSERT INTO leads(campaign_id, import_id, email, fields_json, status, unsub_token, updated_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (campaign_id, import_id, email_addr, json.dumps(fields), status,
+             secrets.token_urlsafe(24), now))
+        if status == "suppressed":
+            counts["suppressed"] += 1
+            core.log_event(conn, "suppressed_skip", "on suppression list at import", cur.lastrowid,
+                           campaign_id, email_addr)
+            reject(counts["rows"], email_addr, "suppressed")
+        else:
+            counts["imported"] += 1
+    # Same `imports` bookkeeping columns the web route writes after the loop (accepted == imported).
+    conn.execute("UPDATE imports SET rows=?, accepted=?, suppressed=?, invalid=?, duplicates=? WHERE id=?",
+                 (counts["rows"], counts["imported"], counts["suppressed"], counts["invalid"],
+                  counts["duplicates"], import_id))
+    return jsonify({"import_id": import_id, "campaign_id": campaign_id, "filename": filename[:255],
+                    "acknowledged_at": now, "acknowledged_by": acknowledged_by, "counts": counts,
+                    "rejected": rejected, "rejected_total": rejected_total[0],
+                    "rejected_truncated": rejected_total[0] > len(rejected)}), 201
 
 
 # ---------------------------------------------------------------- leads + stats

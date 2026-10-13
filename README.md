@@ -228,6 +228,29 @@ curl -X POST -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/mailboxes/1/resu
 # Campaigns
 curl -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/campaigns
 curl -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/campaigns/1
+# Create a draft (steps take delay_days or delay_minutes; list order = step position)
+curl -X POST -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
+  -d '{"name":"Q4 outreach","mailbox_ids":[1],"days":[0,1,2,3,4],"window_start":9,"window_end":17,
+       "steps":[{"subject":"Quick question for {{company}}","body":"Hi {{first_name|there}}, ...","delay_days":0},
+                {"subject":"","body":"Just bumping this.","delay_days":2}]}' \
+  http://127.0.0.1:8080/api/campaigns
+# Edit (drafts and paused only; omitted keys are left alone) and delete (drafts only)
+curl -X PUT -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
+  -d '{"name":"Q4 outreach v2","days":[1,2,3]}' http://127.0.0.1:8080/api/campaigns/1
+curl -X DELETE -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/campaigns/1
+# Steps (locked = already sent) and the merge fields available for the editor
+curl -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/campaigns/1/steps
+curl -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/campaigns/1/fields
+# Preview the lead's next step (or pass "step": 2) with the worker's own renderer
+curl -X POST -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
+  -d '{"lead_id":7}' http://127.0.0.1:8080/api/campaigns/1/preview
+# Import leads: JSON csv_text, or a multipart CSV upload (lawful basis is mandatory)
+curl -X POST -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
+  -d '{"filename":"leads.csv","lawful_basis_confirmed":true,"acknowledged_by":"frontend","csv_text":"email,First Name,Company\nava@example.test,Ava,Brightline\n"}' \
+  http://127.0.0.1:8080/api/campaigns/1/leads/import
+curl -X POST -H "X-API-Key: $API_KEY" -F lawful_basis_confirmed=1 -F acknowledged_by=owner \
+  -F file=@leads.csv http://127.0.0.1:8080/api/campaigns/1/leads/import
+# Start / pause
 curl -X POST -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/campaigns/1/start
 curl -X POST -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/campaigns/1/pause
 
@@ -236,6 +259,8 @@ curl -H "X-API-Key: $API_KEY" 'http://127.0.0.1:8080/api/leads?campaign_id=1&sta
 # Stats (sent/replied/bounced/unsubscribed per campaign and total)
 curl -H "X-API-Key: $API_KEY" http://127.0.0.1:8080/api/stats
 ```
+
+Campaign authoring reuses the web UI's validation: mailboxes must exist, the send window must be valid, step 1 needs a subject and body, merge braces must balance, at most 5 steps, and the timezone must be a real IANA name. Import requires `lawful_basis_confirmed: true` (or the multipart field), checked **before** anything is stored, and the acknowledgement is written to the `imports` table exactly as the UI writes it (who, when, filename). Every CSV column other than `email` is kept as a merge field, emails are normalized and deduped, invalid addresses are skipped, suppressed addresses and whole suppressed domains are imported as `suppressed` (never queued), and the response reports `imported`, `duplicates`, `invalid`, `suppressed` plus the first 20 rejected rows with reasons. `PUT /api/campaigns/{id}` works only for drafts and paused campaigns and never rewrites a step that has already been sent (its position comes back in `locked_steps`); `DELETE` works only for drafts and removes that campaign's steps, mailbox links, imports and leads. `POST /api/campaigns/{id}/preview` renders one lead's next step (or an explicit `step`) with the same renderer the worker uses, reporting `merge_error` instead of raising. None of these endpoints send email — starting stays on the existing start endpoint.
 
 `POST /api/threads/{lead_id}/reply` sends a manual reply from the mailbox that emailed the lead (or an explicit `mailbox_id`), plain text with `Re: <subject>`, `In-Reply-To`/`References` set to the newest message in the thread, and the same mandatory footer, `List-Unsubscribe` headers and unsubscribe link as campaign emails. It is **not a campaign step**: the lead's `current_step` and `status` are not touched and the sequence is never restarted. It is logged in `sends.csv` with `step_pos = 0`, so it counts against the mailbox's daily cap (over the cap → **429**). A suppressed, unsubscribed or bounced lead is refused with **409**; a paused/inactive mailbox with **400**; an SMTP failure with **502** (a hard bounce suppresses the address, like the worker does).
 

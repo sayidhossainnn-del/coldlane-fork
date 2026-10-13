@@ -3,6 +3,7 @@
 Run: python -m unittest discover -s tests
 """
 import datetime as dt
+import io
 import json
 import os
 import socket
@@ -660,6 +661,329 @@ class TestApiThreadReply(ApiBase):
                                            (ids["lead_id"],)).fetchone()[0], 1)  # only the seeded send
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM sends WHERE lead_id=?",
                                            (ids["lead_id"],)).fetchone()[0], 0)  # nothing was accepted
+
+
+class TestApiCampaignWrite(ApiBase):
+    # ---------------------------------------------------------------- helpers
+    def make_mailbox(self, email_addr="a@agency.test", label=None):
+        now = core.ts(core.utcnow())
+        cur = self.conn.execute(
+            "INSERT INTO mailboxes(label, from_name, from_email, smtp_host, created_at) VALUES(?,?,?,?,?)",
+            (label or email_addr, "Sam Sender", email_addr, "127.0.0.1", now))
+        return cur.lastrowid
+
+    def create_campaign(self, mailbox_ids, steps=None, days=None, start=9, end=17, name="API campaign", **extra):
+        if steps is None:
+            steps = [{"subject": "Quick question for {{company}}",
+                      "body": "Hi {{first_name|there}}, are you the right person?", "delay_days": 0},
+                     {"subject": "", "body": "Just bumping this.", "delay_days": 1}]
+        body = {"name": name, "mailbox_ids": mailbox_ids,
+                "days": [0, 1, 2, 3, 4] if days is None else days,
+                "window_start": start, "window_end": end, "steps": steps}
+        body.update(extra)
+        r = self.api("post", "/api/campaigns", json=body)
+        self.assertEqual(r.status_code, 201, r.data)
+        return r.get_json()["campaign"]["id"]
+
+    def import_csv(self, campaign_id, csv_text, filename="leads.csv", lawful=True, acknowledged_by="tester"):
+        return self.api("post", f"/api/campaigns/{campaign_id}/leads/import", json={
+            "filename": filename, "csv_text": csv_text,
+            "lawful_basis_confirmed": lawful, "acknowledged_by": acknowledged_by})
+
+    # ---------------------------------------------------------------- create
+    def test_draft_creation(self):
+        mailbox_id = self.make_mailbox()
+        r = self.api("post", "/api/campaigns", json={
+            "name": "Q4 outreach", "mailbox_ids": [mailbox_id], "days": [0, 1, 2, 3, 4],
+            "window_start": 9, "window_end": 17,
+            "steps": [{"subject": "Hi {{company}}", "body": "Hello {{first_name|there}}", "delay_days": 0},
+                      {"subject": "", "body": "Bump", "delay_minutes": 90}]})
+        self.assertEqual(r.status_code, 201, r.data)
+        body = r.get_json()
+        campaign = body["campaign"]
+        self.assertEqual(campaign["name"], "Q4 outreach")
+        self.assertEqual(campaign["status"], "draft")
+        self.assertEqual(campaign["timezone"], "UTC")
+        self.assertEqual(campaign["window_days"], "0,1,2,3,4")
+        self.assertEqual((campaign["window_start_hour"], campaign["window_end_hour"]), (9, 17))
+        self.assertEqual([s["position"] for s in body["steps"]], [1, 2])
+        self.assertEqual([s["delay_minutes"] for s in body["steps"]], [0, 90])  # delay_days/minute both work
+        self.assertEqual(body["steps"][1]["subject"], "")
+        self.assertEqual([m["id"] for m in body["mailboxes"]], [mailbox_id])
+        self.assertTrue(body["start_errors"])  # no leads yet
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM campaigns WHERE status='draft'").fetchone()[0], 1)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM campaign_mailboxes").fetchone()[0], 1)
+
+    def test_validation_failures(self):
+        mailbox_id = self.make_mailbox()
+        cases = [
+            ({"name": "x", "mailbox_ids": [mailbox_id], "days": [], "window_start": 9, "window_end": 17,
+              "steps": [{"subject": "s", "body": "b"}]}, "Pick at least one send day."),
+            ({"name": "x", "mailbox_ids": [mailbox_id], "days": [0], "window_start": 17, "window_end": 9,
+              "steps": [{"subject": "s", "body": "b"}]}, "Send window must satisfy"),
+            ({"name": "x", "mailbox_ids": [mailbox_id], "days": [0], "window_start": "nine", "window_end": 17,
+              "steps": [{"subject": "s", "body": "b"}]}, "Window hours must be numbers."),
+            ({"name": "x", "mailbox_ids": [mailbox_id], "days": [0], "window_start": 9, "window_end": 17,
+              "timezone": "Mars/Olympus", "steps": [{"subject": "s", "body": "b"}]}, "Unknown timezone"),
+            ({"name": "x", "mailbox_ids": [mailbox_id], "days": [0], "window_start": 9, "window_end": 17,
+              "steps": [{"subject": "", "body": "b"}]}, "Step 1 needs a subject."),
+            ({"name": "x", "mailbox_ids": [mailbox_id], "days": [0], "window_start": 9, "window_end": 17,
+              "steps": [{"subject": "s", "body": ""}]}, "Step 1 needs a body."),
+            ({"name": "x", "mailbox_ids": [mailbox_id], "days": [0], "window_start": 9, "window_end": 17,
+              "steps": [{"subject": "Hi {{company", "body": "b"}]}, "has unbalanced"),
+            ({"name": "x", "mailbox_ids": [9999], "days": [0], "window_start": 9, "window_end": 17,
+              "steps": [{"subject": "s", "body": "b"}]}, "Mailbox 9999 does not exist."),
+            ({"name": "x", "mailbox_ids": "nope", "days": [0], "window_start": 9, "window_end": 17,
+              "steps": [{"subject": "s", "body": "b"}]}, "mailbox_ids must be a list"),
+            ({"name": "x", "mailbox_ids": [mailbox_id], "days": [0], "window_start": 9, "window_end": 17,
+              "steps": [{"subject": "s", "body": "b"}] * 6}, "at most 5 steps"),
+        ]
+        for payload, expected in cases:
+            r = self.api("post", "/api/campaigns", json=payload)
+            self.assertEqual(r.status_code, 400, expected)
+            details = " ".join(r.get_json()["details"])
+            self.assertIn(expected, details)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM campaigns").fetchone()[0], 0)
+
+    # ---------------------------------------------------------------- edit / delete
+    def test_edit_running_campaign_is_rejected(self):
+        mailbox_id = self.make_mailbox()
+        campaign_id = self.create_campaign([mailbox_id])
+        self.conn.execute("UPDATE campaigns SET status='active' WHERE id=?", (campaign_id,))
+        r = self.api("put", f"/api/campaigns/{campaign_id}", json={"name": "nope"})
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("only draft and paused", r.get_json()["error"])
+        self.assertEqual(self.api("delete", f"/api/campaigns/{campaign_id}").status_code, 409)
+        # Paused is editable but still not deletable.
+        self.conn.execute("UPDATE campaigns SET status='paused' WHERE id=?", (campaign_id,))
+        r = self.api("put", f"/api/campaigns/{campaign_id}", json={"name": "Renamed"})
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertEqual(r.get_json()["campaign"]["name"], "Renamed")
+        self.assertEqual(self.api("delete", f"/api/campaigns/{campaign_id}").status_code, 409)
+
+    def test_edit_draft_keeps_omitted_parts_and_locks_sent_steps(self):
+        mailbox_id = self.make_mailbox()
+        campaign_id = self.create_campaign([mailbox_id])
+        steps = self.conn.execute("SELECT * FROM steps WHERE campaign_id=? ORDER BY position", (campaign_id,)).fetchall()
+        now = core.ts(core.utcnow())
+        # Pretend step 1 already went out to someone.
+        cur = self.conn.execute(
+            "INSERT INTO leads(campaign_id, email, fields_json, status, unsub_token, updated_at) "
+            "VALUES(?, 'sent@example.test', '{}', 'active', 'tok-sent', ?)", (campaign_id, now))
+        self.conn.execute(
+            "INSERT INTO sends(campaign_id, lead_id, step_id, step_pos, mailbox_id, recipient, recipient_domain, "
+            "message_id, sent_at, status, attempt) VALUES(?,?,?,1,?,?,?,?,?,'sent',1)",
+            (campaign_id, cur.lastrowid, steps[0]["id"], mailbox_id, "sent@example.test", "example.test",
+             "<s1@x>", now))
+        r = self.api("put", f"/api/campaigns/{campaign_id}", json={
+            "name": "Edited",
+            "steps": [{"subject": "REWRITTEN", "body": "REWRITTEN"}, {"subject": "", "body": "New bump"}]})
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertEqual(r.get_json()["locked_steps"], [1])
+        after = self.conn.execute("SELECT * FROM steps WHERE campaign_id=? ORDER BY position",
+                                  (campaign_id,)).fetchall()
+        self.assertEqual(after[0]["subject"], steps[0]["subject"])  # never rewritten
+        self.assertEqual(after[0]["body"], steps[0]["body"])
+        self.assertEqual(after[1]["body"], "New bump")  # unsent step is editable
+        # A PUT that omits steps/mailboxes must not wipe them.
+        r = self.api("put", f"/api/campaigns/{campaign_id}", json={"days": [1, 2]})
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertEqual(len(r.get_json()["steps"]), 2)
+        self.assertEqual([m["id"] for m in r.get_json()["mailboxes"]], [mailbox_id])
+        self.assertEqual(r.get_json()["campaign"]["window_days"], "1,2")
+
+    def test_delete_draft_removes_its_rows(self):
+        mailbox_id = self.make_mailbox()
+        campaign_id = self.create_campaign([mailbox_id])
+        self.assertEqual(self.import_csv(campaign_id, "email,first_name\na@x.test,A\n").status_code, 201)
+        r = self.api("delete", f"/api/campaigns/{campaign_id}")
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertEqual(r.get_json()["leads_deleted"], 1)
+        for table in ("campaigns", "steps", "imports", "leads", "campaign_mailboxes"):
+            self.assertEqual(self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0, table)
+        self.assertEqual(self.api("get", f"/api/campaigns/{campaign_id}").status_code, 404)
+
+    # ---------------------------------------------------------------- import
+    def test_import_requires_lawful_basis_and_email_column(self):
+        mailbox_id = self.make_mailbox()
+        campaign_id = self.create_campaign([mailbox_id])
+        csv_text = "email,first_name\na@example.test,A\n"
+        for payload in ({"filename": "x.csv", "csv_text": csv_text},
+                        {"filename": "x.csv", "csv_text": csv_text, "lawful_basis_confirmed": False}):
+            r = self.api("post", f"/api/campaigns/{campaign_id}/leads/import", json=payload)
+            self.assertEqual(r.status_code, 400)
+            self.assertIn("lawful-basis", r.get_json()["error"])
+        # multipart without the confirmation is refused too
+        r = self.api("post", f"/api/campaigns/{campaign_id}/leads/import",
+                     data={"file": (io.BytesIO(csv_text.encode()), "leads.csv")},
+                     content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM imports").fetchone()[0], 0)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM leads").fetchone()[0], 0)
+
+        # Email column required (checked after the lawful-basis gate, like the web route).
+        r = self.import_csv(campaign_id, "first_name,company\nAva,Brightline\n")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("needs an 'email' column", r.get_json()["error"])
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM imports").fetchone()[0], 0)
+
+    def test_import_multipart_stores_acknowledgement(self):
+        mailbox_id = self.make_mailbox()
+        campaign_id = self.create_campaign([mailbox_id])
+        data = {"file": (io.BytesIO(b"email,first_name\na@example.test,Ava\n"), "My List.csv"),
+                "lawful_basis_confirmed": "1", "acknowledged_by": "frontend-user"}
+        r = self.api("post", f"/api/campaigns/{campaign_id}/leads/import", data=data,
+                     content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 201, r.data)
+        self.assertEqual(r.get_json()["counts"]["imported"], 1)
+        imp = self.conn.execute("SELECT * FROM imports").fetchone()
+        self.assertEqual((imp["filename"], imp["acknowledged_by"]), ("My List.csv", "frontend-user"))
+        self.assertTrue(imp["acknowledged_at"])
+        self.assertEqual((imp["rows"], imp["accepted"]), (1, 1))
+
+    def test_import_custom_columns_suppression_and_duplicates(self):
+        mailbox_id = self.make_mailbox()
+        campaign_id = self.create_campaign([mailbox_id])
+        core.add_suppression(self.conn, email="blocked@example.test", source="manual")
+        core.add_suppression(self.conn, domain="blocked.test", source="manual")
+        csv_text = ("Email,First Name,Company,Notes\n"
+                    "ava@example.test,Ava,Brightline,hello\n"
+                    "AVA@example.test,Ava,Brightline,duplicate-inside-csv\n"
+                    "not-an-email,Bad,Co,x\n"
+                    "blocked@example.test,Bea,Co,suppressed-email\n"
+                    "anyone@blocked.test,Dan,Co,suppressed-domain\n"
+                    "zoe@example.test,Zoe,Zeta,ok\n")
+        r = self.import_csv(campaign_id, csv_text, filename="mixed.csv")
+        self.assertEqual(r.status_code, 201, r.data)
+        body = r.get_json()
+        self.assertEqual(body["counts"], {"rows": 6, "imported": 2, "suppressed": 2, "invalid": 1,
+                                           "duplicates": 1})
+        self.assertEqual([row["reason"] for row in body["rejected"]],
+                         ["duplicate", "invalid email", "suppressed", "suppressed"])
+        self.assertEqual([row["row"] for row in body["rejected"]], [2, 3, 4, 5])
+        self.assertFalse(body["rejected_truncated"])
+
+        # Every other CSV column survives as a merge field; the email is normalized.
+        ava = self.conn.execute("SELECT * FROM leads WHERE campaign_id=? AND email='ava@example.test'",
+                                (campaign_id,)).fetchone()
+        self.assertEqual(json.loads(ava["fields_json"]),
+                         {"first_name": "Ava", "company": "Brightline", "notes": "hello"})
+        self.assertEqual(ava["status"], "queued")
+        # Suppressed addresses are stored but never queued, and are logged like the web import.
+        for address in ("blocked@example.test", "anyone@blocked.test"):
+            row = self.conn.execute("SELECT * FROM leads WHERE campaign_id=? AND email=?",
+                                    (campaign_id, address)).fetchone()
+            self.assertEqual(row["status"], "suppressed")
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM events WHERE kind='suppressed_skip'").fetchone()[0], 2)
+        # Nothing was queued for a suppressed address...
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM leads WHERE campaign_id=? AND status='queued'", (campaign_id,)).fetchone()[0], 2)
+        # ...and a second import of the same file is all duplicates.
+        again = self.import_csv(campaign_id, csv_text).get_json()["counts"]
+        # 'ava' and 'zoe' plus the two stored suppressed addresses are already in the campaign.
+        self.assertEqual((again["imported"], again["duplicates"], again["invalid"]), (0, 5, 1))
+
+        fields = self.api("get", f"/api/campaigns/{campaign_id}/fields").get_json()["fields"]
+        self.assertEqual(fields, ["email", "company", "first_name", "notes"])
+
+    def test_import_rejected_rows_capped_at_20(self):
+        mailbox_id = self.make_mailbox()
+        campaign_id = self.create_campaign([mailbox_id])
+        rows = "\n".join(f"bad{i},nope" for i in range(25))
+        r = self.import_csv(campaign_id, "email,first_name\n" + rows + "\n")
+        body = r.get_json()
+        self.assertEqual(body["counts"]["invalid"], 25)
+        self.assertEqual(len(body["rejected"]), 20)
+        self.assertEqual(body["rejected_total"], 25)
+        self.assertTrue(body["rejected_truncated"])
+
+    def test_import_unknown_campaign(self):
+        r = self.import_csv(9999, "email\na@example.test\n")
+        self.assertEqual(r.status_code, 404)
+
+    # ---------------------------------------------------------------- steps / preview
+    def test_steps_endpoint_marks_locked(self):
+        mailbox_id = self.make_mailbox()
+        campaign_id = self.create_campaign([mailbox_id])
+        steps = self.api("get", f"/api/campaigns/{campaign_id}/steps").get_json()["steps"]
+        self.assertEqual([s["position"] for s in steps], [1, 2])
+        self.assertEqual([s["locked"] for s in steps], [False, False])
+        now = core.ts(core.utcnow())
+        cur = self.conn.execute(
+            "INSERT INTO leads(campaign_id, email, fields_json, status, unsub_token, updated_at) "
+            "VALUES(?, 'sent@example.test', '{}', 'active', 'tok-s', ?)", (campaign_id, now))
+        self.conn.execute(
+            "INSERT INTO sends(campaign_id, lead_id, step_id, step_pos, mailbox_id, recipient, recipient_domain, "
+            "message_id, sent_at, status, attempt) VALUES(?,?,?,1,?,?,?,?,?,'sent',1)",
+            (campaign_id, cur.lastrowid, steps[0]["id"], mailbox_id, "sent@example.test", "example.test",
+             "<s@x>", now))
+        steps = self.api("get", f"/api/campaigns/{campaign_id}/steps").get_json()["steps"]
+        self.assertEqual([s["locked"] for s in steps], [True, False])
+        self.assertEqual(self.api("get", "/api/campaigns/9999/steps").status_code, 404)
+        self.assertEqual(self.api("get", "/api/campaigns/9999/fields").status_code, 404)
+
+    def test_preview_rendering(self):
+        mailbox_id = self.make_mailbox()
+        campaign_id = self.create_campaign([mailbox_id])
+        self.assertEqual(self.import_csv(
+            campaign_id, "email,first_name,company\nava@example.test,Ava,Brightline\nno@example.test,,\n")
+            .status_code, 201)
+        ava = self.conn.execute("SELECT * FROM leads WHERE email='ava@example.test' AND campaign_id=?",
+                                (campaign_id,)).fetchone()
+        nofields = self.conn.execute("SELECT * FROM leads WHERE email='no@example.test' AND campaign_id=?",
+                                     (campaign_id,)).fetchone()
+
+        r = self.api("post", f"/api/campaigns/{campaign_id}/preview", json={"lead_id": ava["id"]})
+        self.assertEqual(r.status_code, 200, r.data)
+        body = r.get_json()
+        self.assertIsNone(body["merge_error"])
+        self.assertEqual(body["position"], 1)
+        self.assertEqual(body["subject"], "Quick question for Brightline")
+        self.assertEqual(body["body"], "Hi Ava, are you the right person?")
+        self.assertIn("12 Test Street, Testville, CA 90000, USA", body["text"])
+        self.assertIn(f"http://127.0.0.1:8080/u/{ava['unsub_token']}", body["text"])
+        self.assertEqual(body["fields"]["company"], "Brightline")
+
+        # A missing merge value without a fallback is reported, not raised.
+        r = self.api("post", f"/api/campaigns/{campaign_id}/preview", json={"lead_id": nofields["id"]})
+        self.assertEqual(r.status_code, 200)
+        body = r.get_json()
+        self.assertIn("company", body["merge_error"])
+        self.assertIsNone(body["subject"])
+        self.assertIsNone(body["body"])
+
+        # The follow-up step has no subject, so it renders the worker's Re: subject.
+        r = self.api("post", f"/api/campaigns/{campaign_id}/preview",
+                     json={"lead_id": ava["id"], "step": 2})
+        self.assertEqual(r.get_json()["subject"], "Re: Quick question for Brightline")
+        self.assertEqual(r.get_json()["body"], "Just bumping this.")
+
+        self.assertEqual(self.api("post", f"/api/campaigns/{campaign_id}/preview",
+                                  json={"lead_id": 9999}).status_code, 404)
+        self.assertEqual(self.api("post", f"/api/campaigns/{campaign_id}/preview",
+                                  json={"lead_id": ava["id"], "step": 9}).status_code, 404)
+        self.assertEqual(self.api("post", f"/api/campaigns/{campaign_id}/preview", json={}).status_code, 400)
+        # A lead from another campaign is not previewable here.
+        other = self.create_campaign([mailbox_id], name="Other")
+        self.assertEqual(self.api("post", f"/api/campaigns/{other}/preview",
+                                  json={"lead_id": ava["id"]}).status_code, 404)
+        no_steps = self.create_campaign([mailbox_id], steps=[], name="No steps")
+        self.assertEqual(self.import_csv(no_steps, "email,first_name\nempt@example.test,E\n").status_code, 201)
+        empty_lead = self.conn.execute("SELECT id FROM leads WHERE campaign_id=?", (no_steps,)).fetchone()[0]
+        r = self.api("post", f"/api/campaigns/{no_steps}/preview", json={"lead_id": empty_lead})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("no steps", r.get_json()["error"])
+
+    def test_campaign_write_requires_api_key(self):
+        mailbox_id = self.make_mailbox()
+        payload = {"name": "x", "mailbox_ids": [mailbox_id], "days": [0], "window_start": 9,
+                   "window_end": 17, "steps": [{"subject": "s", "body": "b"}]}
+        self.assertEqual(self.client.post("/api/campaigns", json=payload).status_code, 401)
+        self.assertEqual(self.client.get("/api/campaigns/1/steps").status_code, 401)
+        self.assertEqual(self.client.post("/api/campaigns/1/leads/import", json={}).status_code, 401)
+        self.assertEqual(self.client.put("/api/campaigns/1", json={}).status_code, 401)
+        self.assertEqual(self.client.delete("/api/campaigns/1").status_code, 401)
 
 
 if __name__ == "__main__":
