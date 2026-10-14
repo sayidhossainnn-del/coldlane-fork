@@ -101,9 +101,10 @@ export function Inbox({ toast }: { toast: (m: string, t?: string) => void }) {
     setSending(true);
     api
       .sendReply(active.id, draft.trim())
-      .then(() => {
+      .then((r) => {
         setDraft("");
-        toast("Reply sent", "emerald");
+        // Real server result: the SMTP response and today's remaining cap.
+        toast(`Reply sent · ${r.smtp_result} · ${r.remaining_capacity} left today`, "emerald");
         open(active);
       })
       .catch((err) => toast(api.errorMessage(err), "rose"))

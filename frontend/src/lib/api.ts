@@ -187,7 +187,7 @@ export function markThreadRead(leadId: string) {
 }
 
 export function sendReply(leadId: string, body: string) {
-  return http.post<{ smtp_result: string }>(`/threads/${toId(leadId)}/reply`, { body });
+  return http.post<{ smtp_result: string; remaining_capacity: number }>(`/threads/${toId(leadId)}/reply`, { body });
 }
 
 export function draftReply(leadId: string, instructions?: string) {
